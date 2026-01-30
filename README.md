@@ -76,6 +76,10 @@ solana program dump --url https://api.mainnet-beta.solana.com \
 solana program dump --url https://api.mainnet-beta.solana.com \
     worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth \
     fixtures/core_bridge.so
+
+solana program dump --url https://api.mainnet-beta.solana.com \
+    EtZMZM22ViKMo4r5y4Anovs3wKQ2owUmDpjygnMMcdEX \
+    fixtures/post_message_shim.so
 ```
 
 Or set `WORMHOLE_FIXTURES_DIR` to point to existing binaries.

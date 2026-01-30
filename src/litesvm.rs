@@ -7,7 +7,10 @@ use solana_sdk::{account::Account, pubkey::Pubkey, rent::Rent};
 use thiserror::Error;
 use wormhole_svm_definitions::{
     find_guardian_set_address,
-    solana::{CORE_BRIDGE_CONFIG, CORE_BRIDGE_PROGRAM_ID, VERIFY_VAA_SHIM_PROGRAM_ID},
+    solana::{
+        CORE_BRIDGE_CONFIG, CORE_BRIDGE_PROGRAM_ID, POST_MESSAGE_SHIM_PROGRAM_ID,
+        VERIFY_VAA_SHIM_PROGRAM_ID,
+    },
 };
 
 use crate::TestGuardianSet;
@@ -19,6 +22,10 @@ pub const VERIFY_VAA_SHIM_BYTES: &[u8] = include_bytes!("../fixtures/verify_vaa_
 /// Bundled Wormhole Core Bridge program binary (mainnet).
 #[cfg(feature = "bundled-fixtures")]
 pub const CORE_BRIDGE_BYTES: &[u8] = include_bytes!("../fixtures/core_bridge.so");
+
+/// Bundled Wormhole Post Message Shim program binary (mainnet).
+#[cfg(feature = "bundled-fixtures")]
+pub const POST_MESSAGE_SHIM_BYTES: &[u8] = include_bytes!("../fixtures/post_message_shim.so");
 
 /// Errors that can occur when setting up Wormhole in LiteSVM.
 #[derive(Error, Debug)]
@@ -41,6 +48,8 @@ pub struct WormholeProgramsConfig {
     pub verify_vaa_shim: Option<PathBuf>,
     /// Path to core_bridge.so (or None to search default locations).
     pub core_bridge: Option<PathBuf>,
+    /// Path to post_message_shim.so (or None to search default locations).
+    pub post_message_shim: Option<PathBuf>,
 }
 
 impl Default for WormholeProgramsConfig {
@@ -48,6 +57,7 @@ impl Default for WormholeProgramsConfig {
         Self {
             verify_vaa_shim: None,
             core_bridge: None,
+            post_message_shim: None,
         }
     }
 }
@@ -75,6 +85,10 @@ Or dump them from mainnet yourself:
     solana program dump --url https://api.mainnet-beta.solana.com \
         worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth \
         fixtures/core_bridge.so
+
+    solana program dump --url https://api.mainnet-beta.solana.com \
+        EtZMZM22ViKMo4r5y4Anovs3wKQ2owUmDpjygnMMcdEX \
+        fixtures/post_message_shim.so
 
 Or set WORMHOLE_FIXTURES_DIR environment variable to point to existing binaries."#;
 
@@ -143,6 +157,18 @@ pub fn load_wormhole_programs(
     )?;
     svm.add_program(CORE_BRIDGE_PROGRAM_ID, &bridge_bytes)
         .map_err(|e| WormholeTestError::LoadError(format!("core_bridge: {}", e)))?;
+
+    // Load Post Message Shim
+    let post_shim_bytes = get_program_bytes(
+        "post_message_shim.so",
+        config.post_message_shim.as_ref(),
+        #[cfg(feature = "bundled-fixtures")]
+        Some(POST_MESSAGE_SHIM_BYTES),
+        #[cfg(not(feature = "bundled-fixtures"))]
+        None,
+    )?;
+    svm.add_program(POST_MESSAGE_SHIM_PROGRAM_ID, &post_shim_bytes)
+        .map_err(|e| WormholeTestError::LoadError(format!("post_message_shim: {}", e)))?;
 
     Ok(())
 }
@@ -360,6 +386,9 @@ mod tests {
 
         let bridge_account = svm.get_account(&CORE_BRIDGE_PROGRAM_ID);
         assert!(bridge_account.is_some(), "Core bridge not loaded");
+
+        let post_shim_account = svm.get_account(&POST_MESSAGE_SHIM_PROGRAM_ID);
+        assert!(post_shim_account.is_some(), "Post message shim not loaded");
     }
 
     #[cfg(feature = "bundled-fixtures")]
@@ -369,5 +398,6 @@ mod tests {
         // ELF magic number: 0x7f 'E' 'L' 'F'
         assert_eq!(&VERIFY_VAA_SHIM_BYTES[0..4], &[0x7f, b'E', b'L', b'F']);
         assert_eq!(&CORE_BRIDGE_BYTES[0..4], &[0x7f, b'E', b'L', b'F']);
+        assert_eq!(&POST_MESSAGE_SHIM_BYTES[0..4], &[0x7f, b'E', b'L', b'F']);
     }
 }
