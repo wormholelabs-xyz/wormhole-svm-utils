@@ -51,6 +51,8 @@ pub enum WormholeTestError {
     IoError(#[from] std::io::Error),
     #[error("Failed to load program: {0}")]
     LoadError(String),
+    #[error("VAA verification bypass detected: {0}")]
+    VerificationBypass(String),
 }
 
 /// Configuration for loading Wormhole programs.
@@ -443,6 +445,146 @@ where
     Ok(result)
 }
 
+/// Execute a closure that verifies a VAA, with automatic verification safety check.
+///
+/// This helper ensures your program actually verifies VAAs by:
+///
+/// 1. **Negative test (on cloned SVM)**: Clones the SVM, posts mismatched signatures,
+///    and runs your closure. If it succeeds, your program doesn't verify VAAs -
+///    returns `VerificationBypass` error. The clone is discarded, so no state persists.
+///
+/// 2. **Positive test (on original SVM)**: Posts correct signatures and runs your
+///    closure, committing state changes.
+///
+/// The closure receives `(svm, guardian_signatures_pubkey, vaa_body)` where `vaa_body`
+/// is just the body bytes (used for digest calculation). Using clone + discard
+/// ensures the negative test behaves identically to real execution.
+///
+/// # Example
+///
+/// ```ignore
+/// use wormhole_svm_test::{with_vaa, TestVaa, emitter_address_from_20};
+///
+/// let vaa = TestVaa::new(1, emitter_address_from_20([0xAB; 20]), 42, payload);
+///
+/// let result = with_vaa(
+///     &mut svm,
+///     &payer,
+///     &guardians,
+///     0, // guardian_set_index
+///     &vaa,
+///     |svm, sigs_pubkey, vaa_body| {
+///         let ix = build_my_verify_instruction(sigs_pubkey, vaa_body);
+///         let tx = Transaction::new_signed_with_payer(...);
+///         svm.send_transaction(tx).map_err(|e| format!("{:?}", e))
+///     },
+/// )?;
+/// ```
+///
+/// # See Also
+///
+/// - [`with_vaa_unchecked`] - Skip the automatic negative test (use sparingly)
+pub fn with_vaa<F, T, E>(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    guardians: &TestGuardianSet,
+    guardian_set_index: u32,
+    vaa: &crate::TestVaa,
+    mut f: F,
+) -> Result<T, WormholeTestError>
+where
+    F: FnMut(&mut LiteSVM, &Pubkey, &[u8]) -> Result<T, E>,
+    E: std::fmt::Display,
+{
+    // Get just the body bytes - this is what the program needs for digest calculation
+    let vaa_body = vaa.body();
+
+    // === NEGATIVE TEST (on cloned SVM - discarded after) ===
+    // Clone the SVM so any state changes from the negative test don't persist
+    let mut svm_clone = svm.clone();
+
+    // Sign a DIFFERENT VAA (modified sequence) - signatures are valid but for wrong data
+    let modified_vaa = crate::TestVaa {
+        sequence: vaa.sequence.wrapping_add(1),
+        ..vaa.clone()
+    };
+    let wrong_signatures = modified_vaa.guardian_signatures(guardians);
+
+    // Post wrong signatures to the CLONE
+    let wrong_posted =
+        post_signatures(&mut svm_clone, payer, guardian_set_index, &wrong_signatures)?;
+
+    // Run closure on the clone with ORIGINAL body but WRONG signatures
+    // If the program verifies, this should fail (digest won't match)
+    let negative_result = f(&mut svm_clone, &wrong_posted.pubkey, &vaa_body);
+
+    // Clone is discarded here (dropped) - no state changes persist
+
+    // If negative test succeeded, the program doesn't verify VAAs!
+    if negative_result.is_ok() {
+        return Err(WormholeTestError::VerificationBypass(
+            "SECURITY: Program accepted VAA with mismatched signatures! \
+             This means your program is not actually verifying VAAs. \
+             Ensure you call verify_hash CPI before processing the VAA."
+                .to_string(),
+        ));
+    }
+
+    // === POSITIVE TEST (on original SVM - commits state) ===
+    let correct_signatures = vaa.guardian_signatures(guardians);
+    let posted = post_signatures(svm, payer, guardian_set_index, &correct_signatures)?;
+
+    // Run closure on original SVM with correct signatures
+    let result = f(svm, &posted.pubkey, &vaa_body)
+        .map_err(|e| WormholeTestError::LoadError(format!("VAA verification failed: {}", e)))?;
+
+    close_signatures(svm, payer, &posted.pubkey, &payer.pubkey())?;
+
+    Ok(result)
+}
+
+/// Execute a closure that verifies a VAA, WITHOUT automatic verification check.
+///
+/// This is the unchecked version of [`with_vaa`] that skips the automatic negative
+/// test. Use this only when you have a specific reason to skip the safety check,
+/// such as testing error handling paths or when you need full control over execution.
+///
+/// **Prefer [`with_vaa`] in most cases** - it automatically ensures your program
+/// actually verifies VAAs.
+///
+/// # Example
+///
+/// ```ignore
+/// // Only use this if you have a specific reason to skip the safety check
+/// with_vaa_unchecked(&mut svm, &payer, &guardians, 0, &vaa, |svm, sigs_pubkey, vaa_body| {
+///     let tx = Transaction::new_signed_with_payer(...);
+///     svm.send_transaction(tx).map_err(|e| format!("{:?}", e))
+/// })?;
+/// ```
+pub fn with_vaa_unchecked<F, T, E>(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    guardians: &TestGuardianSet,
+    guardian_set_index: u32,
+    vaa: &crate::TestVaa,
+    f: F,
+) -> Result<T, WormholeTestError>
+where
+    F: FnOnce(&mut LiteSVM, &Pubkey, &[u8]) -> Result<T, E>,
+    E: std::fmt::Display,
+{
+    let vaa_body = vaa.body();
+    let signatures = vaa.guardian_signatures(guardians);
+
+    let posted = post_signatures(svm, payer, guardian_set_index, &signatures)?;
+
+    let result = f(svm, &posted.pubkey, &vaa_body)
+        .map_err(|e| WormholeTestError::LoadError(format!("closure failed: {}", e)))?;
+
+    close_signatures(svm, payer, &posted.pubkey, &payer.pubkey())?;
+
+    Ok(result)
+}
 /// Build a post_signatures instruction without sending it.
 ///
 /// Useful if you need to combine this with other instructions in a single transaction.
@@ -669,4 +811,7 @@ mod tests {
             "Signatures account should be closed after bracket"
         );
     }
+
+    // Note: with_vaa and with_vaa_unchecked are tested in the integration tests
+    // (tests/verify_vaa_example.rs) which use a real program that verifies VAAs.
 }

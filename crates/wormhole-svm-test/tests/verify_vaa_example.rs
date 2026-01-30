@@ -2,9 +2,9 @@
 //!
 //! This test shows the complete flow of:
 //! 1. Setting up a LiteSVM environment with Wormhole programs
-//! 2. Creating test guardians and building a signed VAA
+//! 2. Creating test guardians and building VAA body + signatures
 //! 3. Posting guardian signatures to the verify shim
-//! 4. Calling a program that verifies the VAA via CPI
+//! 4. Calling a program that verifies the VAA body via CPI
 //! 5. Closing the signatures account to reclaim rent
 
 #![cfg(feature = "bundled-fixtures")]
@@ -90,9 +90,9 @@ fn test_end_to_end_vaa_verification() {
         test_payload,
     );
 
-    // Get signed VAA bytes
-    let vaa_bytes = vaa.sign(&guardians);
-    println!("VAA bytes length: {}", vaa_bytes.len());
+    // Get VAA body (just the body bytes, used for digest calculation)
+    let vaa_body = vaa.body();
+    println!("VAA body length: {}", vaa_body.len());
 
     // Get guardian signatures for post_signatures
     let guardian_signatures = vaa.guardian_signatures(&guardians);
@@ -104,13 +104,13 @@ fn test_end_to_end_vaa_verification() {
 
     println!("Posted signatures to: {}", posted.pubkey);
 
-    // Step 7: Call the example program to verify the VAA
+    // Step 7: Call the example program to verify the VAA body
     let verify_ix = vaa_verifier_example::build_verify_vaa_instruction(
         &payer.pubkey(),
         &wormhole.guardian_set,
         &posted.pubkey,
         wormhole.guardian_set_bump,
-        &vaa_bytes,
+        &vaa_body,
     );
 
     let blockhash = svm.latest_blockhash();
@@ -138,9 +138,156 @@ fn test_end_to_end_vaa_verification() {
     println!("Test complete!");
 }
 
-/// Test using the with_posted_signatures bracket helper.
+/// Test using the with_vaa bracket helper (recommended approach).
+///
+/// This is the cleanest API - just provide the VAA and let the helper
+/// handle signing, posting, verification safety check, and cleanup.
 #[test]
-fn test_with_bracket_pattern() {
+fn test_with_vaa_helper() {
+    use wormhole_svm_test::with_vaa;
+
+    let mut svm = LiteSVM::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let guardians = TestGuardianSet::single(TestGuardian::default());
+
+    let wormhole = setup_wormhole(
+        &mut svm,
+        &guardians,
+        GUARDIAN_SET_INDEX,
+        WormholeProgramsConfig::default(),
+    )
+    .expect("Failed to setup Wormhole");
+
+    load_example_program(&mut svm);
+
+    // Create the VAA
+    let vaa = TestVaa::new(
+        1,
+        emitter_address_from_20([0xEF; 20]),
+        999,
+        b"with_vaa helper test".to_vec(),
+    );
+
+    // with_vaa:
+    // 1. Clones SVM, runs with wrong signatures (should fail - verifies program checks)
+    // 2. Runs on original SVM with correct signatures (should succeed)
+    let result = with_vaa(
+        &mut svm,
+        &payer,
+        &guardians,
+        GUARDIAN_SET_INDEX,
+        &vaa,
+        |svm, sigs_pubkey, vaa_body| {
+            let verify_ix = vaa_verifier_example::build_verify_vaa_instruction(
+                &payer.pubkey(),
+                &wormhole.guardian_set,
+                sigs_pubkey,
+                wormhole.guardian_set_bump,
+                vaa_body,
+            );
+
+            let blockhash = svm.latest_blockhash();
+            let tx = Transaction::new_signed_with_payer(
+                &[verify_ix],
+                Some(&payer.pubkey()),
+                &[&payer],
+                blockhash,
+            );
+
+            svm.send_transaction(tx)
+                .map_err(|e| format!("tx failed: {:?}", e))
+        },
+    );
+
+    assert!(result.is_ok(), "with_vaa test failed: {:?}", result);
+    println!("with_vaa helper test complete!");
+}
+
+/// Test that with_vaa catches programs that skip VAA verification.
+///
+/// This test uses the insecure `skip_verify` instruction which parses
+/// the VAA body but does NOT call the verify_hash CPI. The `with_vaa` helper
+/// should detect this and return a VerificationBypass error.
+#[test]
+fn test_with_vaa_catches_unverified_program() {
+    use wormhole_svm_test::{with_vaa, WormholeTestError};
+
+    let mut svm = LiteSVM::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let guardians = TestGuardianSet::single(TestGuardian::default());
+
+    let wormhole = setup_wormhole(
+        &mut svm,
+        &guardians,
+        GUARDIAN_SET_INDEX,
+        WormholeProgramsConfig::default(),
+    )
+    .expect("Failed to setup Wormhole");
+
+    load_example_program(&mut svm);
+
+    let vaa = TestVaa::new(
+        1,
+        emitter_address_from_20([0xBA; 20]),
+        777,
+        b"This VAA will not be verified!".to_vec(),
+    );
+
+    // Use the INSECURE skip_verify instruction
+    let result = with_vaa(
+        &mut svm,
+        &payer,
+        &guardians,
+        GUARDIAN_SET_INDEX,
+        &vaa,
+        |svm, sigs_pubkey, vaa_body| {
+            // Use the insecure instruction that skips verification
+            let skip_ix = vaa_verifier_example::build_skip_verify_instruction(
+                &payer.pubkey(),
+                &wormhole.guardian_set,
+                sigs_pubkey,
+                wormhole.guardian_set_bump,
+                vaa_body,
+            );
+
+            let blockhash = svm.latest_blockhash();
+            let tx = Transaction::new_signed_with_payer(
+                &[skip_ix],
+                Some(&payer.pubkey()),
+                &[&payer],
+                blockhash,
+            );
+
+            svm.send_transaction(tx)
+                .map_err(|e| format!("tx failed: {:?}", e))
+        },
+    );
+
+    // with_vaa should detect the bypass and return an error
+    assert!(
+        result.is_err(),
+        "with_vaa should have detected verification bypass"
+    );
+
+    match result {
+        Err(WormholeTestError::VerificationBypass(msg)) => {
+            println!("Correctly caught verification bypass: {}", msg);
+            assert!(msg.contains("SECURITY"));
+        }
+        Err(e) => panic!("Expected VerificationBypass error, got: {:?}", e),
+        Ok(_) => panic!("Expected error but got success"),
+    }
+
+    println!("with_vaa correctly detected the insecure program!");
+}
+
+/// Test using the with_posted_signatures bracket helper (lower-level).
+#[test]
+fn test_with_posted_signatures_pattern() {
     use wormhole_svm_test::with_posted_signatures;
 
     let mut svm = LiteSVM::new();
@@ -166,7 +313,7 @@ fn test_with_bracket_pattern() {
         b"Bracket pattern test".to_vec(),
     );
 
-    let vaa_bytes = vaa.sign(&guardians);
+    let vaa_body = vaa.body();
     let guardian_signatures = vaa.guardian_signatures(&guardians);
 
     // Use the bracket pattern - signatures are automatically posted and closed
@@ -181,7 +328,7 @@ fn test_with_bracket_pattern() {
                 &wormhole.guardian_set,
                 sigs_pubkey,
                 wormhole.guardian_set_bump,
-                &vaa_bytes,
+                &vaa_body,
             );
 
             let blockhash = svm.latest_blockhash();

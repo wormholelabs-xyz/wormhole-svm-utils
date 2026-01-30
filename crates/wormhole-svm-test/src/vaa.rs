@@ -5,6 +5,7 @@ use sha3::{Digest, Keccak256};
 use crate::TestGuardianSet;
 
 /// A test VAA for construction and signing.
+#[derive(Clone)]
 pub struct TestVaa {
     /// The emitter chain ID.
     pub emitter_chain: u16,

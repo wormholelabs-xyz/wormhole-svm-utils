@@ -58,14 +58,45 @@ let wormhole = setup_wormhole(
 // wormhole.guardian_set is the PDA address
 ```
 
-### Posting and Verifying Signatures
+### Verifying VAAs (Recommended)
 
-Use the bracket pattern to automatically handle posting and closing signatures:
+Use `with_vaa` for the cleanest API. It automatically ensures your program actually
+verifies VAAs:
+
+1. **Negative test (on cloned SVM)**: Clones the SVM, posts mismatched signatures, and
+   executes your transaction. If it succeeds, returns `VerificationBypass` error - your
+   program isn't verifying! (Clone is discarded, no state changes persist.)
+2. **Positive test (executed)**: Builds and sends your transaction with correct signatures.
+
+```rust
+use wormhole_svm_test::{with_vaa, TestVaa, emitter_address_from_20};
+
+let vaa = TestVaa::new(1, emitter_address_from_20([0xAB; 20]), 42, payload);
+
+// Closure receives (svm, sigs_pubkey, vaa_body) - body bytes for digest calculation
+let result = with_vaa(
+    &mut svm,
+    &payer,
+    &guardians,
+    0, // guardian set index
+    &vaa,
+    |svm, sigs_pubkey, vaa_body| {
+        let ix = build_my_verify_instruction(sigs_pubkey, vaa_body);
+        let tx = Transaction::new_signed_with_payer(...);
+        svm.send_transaction(tx).map_err(|e| format!("{:?}", e))
+    },
+)?;
+```
+
+### Lower-Level: with_posted_signatures
+
+If you need more control over VAA construction and signing:
 
 ```rust
 use wormhole_svm_test::{with_posted_signatures, TestVaa, TestGuardianSet};
 
 let vaa = TestVaa::new(1, emitter, sequence, payload);
+let vaa_body = vaa.body();  // Body bytes for digest calculation
 let signatures = vaa.guardian_signatures(&guardians);
 
 // Bracket pattern: post signatures, run closure, close signatures
@@ -75,22 +106,27 @@ with_posted_signatures(
     0, // guardian set index
     &signatures,
     |svm, sigs_pubkey| {
-        // Your code that uses verify_hash CPI goes here
-        // sigs_pubkey is the guardian signatures account
+        // Your code that uses verify_hash CPI with vaa_body goes here
         Ok(())
     },
 )?;
 ```
 
-Or manage posting/closing manually:
+### Manual Control
+
+For full control over the signature lifecycle:
 
 ```rust
-use wormhole_svm_test::{post_signatures, close_signatures};
+use wormhole_svm_test::{post_signatures, close_signatures, TestVaa};
+
+let vaa = TestVaa::new(1, emitter, sequence, payload);
+let vaa_body = vaa.body();  // Body bytes for digest calculation
+let signatures = vaa.guardian_signatures(&guardians);
 
 // Step 1: Post signatures
 let posted = post_signatures(&mut svm, &payer, 0, &signatures)?;
 
-// Step 2: Your verification logic using posted.pubkey
+// Step 2: Your verification logic using posted.pubkey and vaa_body
 // ...
 
 // Step 3: Close to reclaim rent
