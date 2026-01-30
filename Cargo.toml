@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [features]
 default = []
-litesvm = ["dep:litesvm", "dep:solana-sdk", "dep:wormhole-svm-definitions"]
+litesvm = ["dep:litesvm", "dep:solana-sdk", "dep:wormhole-svm-definitions", "dep:wormhole-svm-shim"]
 bundled-fixtures = ["litesvm"]
 
 [dependencies]
@@ -26,5 +26,9 @@ optional = true
 
 [dependencies.wormhole-svm-definitions]
 git = "https://github.com/wormhole-foundation/wormhole"
-features = ["solana"]
+features = ["solana", "verify-vaa-shim"]
+optional = true
+
+[dependencies.wormhole-svm-shim]
+git = "https://github.com/wormhole-foundation/wormhole"
 optional = true

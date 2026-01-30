@@ -7,6 +7,7 @@ Testing utilities for Solana programs integrating with Wormhole.
 - **Guardian signing**: Create test guardians with configurable keys, sign VAA bodies
 - **VAA construction**: Build and sign VAAs for testing
 - **LiteSVM integration** (optional): Load Wormhole programs and set up guardian accounts
+- **Signature helpers** (optional): Post/close guardian signatures with bracket pattern
 - **Bundled fixtures** (optional): Pre-bundled mainnet program binaries for zero-setup testing
 
 ## Usage
@@ -57,6 +58,45 @@ let wormhole = setup_wormhole(
 // wormhole.guardian_set is the PDA address
 ```
 
+### Posting and Verifying Signatures
+
+Use the bracket pattern to automatically handle posting and closing signatures:
+
+```rust
+use wormhole_svm_test::{with_posted_signatures, TestVaa, TestGuardianSet};
+
+let vaa = TestVaa::new(1, emitter, sequence, payload);
+let signatures = vaa.guardian_signatures(&guardians);
+
+// Bracket pattern: post signatures, run closure, close signatures
+with_posted_signatures(
+    &mut svm,
+    &payer,
+    0, // guardian set index
+    &signatures,
+    |svm, sigs_pubkey| {
+        // Your code that uses verify_hash CPI goes here
+        // sigs_pubkey is the guardian signatures account
+        Ok(())
+    },
+)?;
+```
+
+Or manage posting/closing manually:
+
+```rust
+use wormhole_svm_test::{post_signatures, close_signatures};
+
+// Step 1: Post signatures
+let posted = post_signatures(&mut svm, &payer, 0, &signatures)?;
+
+// Step 2: Your verification logic using posted.pubkey
+// ...
+
+// Step 3: Close to reclaim rent
+close_signatures(&mut svm, &payer, &posted.pubkey, &payer.pubkey())?;
+```
+
 ### Without Bundled Fixtures
 
 If you prefer to manage your own binaries, use just the `litesvm` feature:
@@ -70,7 +110,7 @@ Then dump the programs from mainnet:
 
 ```bash
 solana program dump --url https://api.mainnet-beta.solana.com \
-    HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ \
+    EFaNWErqAtVWufdNb7yofSHHfWFos843DFpu4JBw24at \
     fixtures/verify_vaa_shim.so
 
 solana program dump --url https://api.mainnet-beta.solana.com \

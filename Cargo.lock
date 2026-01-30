@@ -5310,6 +5310,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wormhole-svm-shim"
+version = "0.1.0"
+source = "git+https://github.com/wormhole-foundation/wormhole#e11926a849391e8a035c69fc52f4efb3205258fd"
+dependencies = [
+ "solana-program",
+ "wormhole-svm-definitions",
+]
+
+[[package]]
 name = "wormhole-svm-test"
 version = "0.1.0"
 dependencies = [
@@ -5320,6 +5329,7 @@ dependencies = [
  "solana-sdk",
  "thiserror 1.0.69",
  "wormhole-svm-definitions",
+ "wormhole-svm-shim",
 ]
 
 [[package]]

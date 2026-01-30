@@ -3,14 +3,25 @@
 use std::path::PathBuf;
 
 use litesvm::LiteSVM;
-use solana_sdk::{account::Account, pubkey::Pubkey, rent::Rent};
+use solana_sdk::{
+    account::Account,
+    instruction::Instruction,
+    pubkey::Pubkey,
+    rent::Rent,
+    signature::{Keypair, Signer},
+    transaction::Transaction,
+};
 use thiserror::Error;
 use wormhole_svm_definitions::{
     find_guardian_set_address,
-    solana::{
+    solana::mainnet::{
         CORE_BRIDGE_CONFIG, CORE_BRIDGE_PROGRAM_ID, POST_MESSAGE_SHIM_PROGRAM_ID,
         VERIFY_VAA_SHIM_PROGRAM_ID,
     },
+};
+use wormhole_svm_shim::verify_vaa::{
+    CloseSignatures, CloseSignaturesAccounts, PostSignatures, PostSignaturesAccounts,
+    PostSignaturesData,
 };
 
 use crate::TestGuardianSet;
@@ -79,7 +90,7 @@ Enable the `bundled-fixtures` feature to use pre-bundled mainnet binaries:
 Or dump them from mainnet yourself:
 
     solana program dump --url https://api.mainnet-beta.solana.com \
-        HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ \
+        EFaNWErqAtVWufdNb7yofSHHfWFos843DFpu4JBw24at \
         fixtures/verify_vaa_shim.so
 
     solana program dump --url https://api.mainnet-beta.solana.com \
@@ -309,6 +320,166 @@ pub fn build_guardian_set_data(guardians: &TestGuardianSet, index: u32) -> Vec<u
     data
 }
 
+/// Result of posting signatures to the verify shim.
+pub struct PostedSignatures {
+    /// The keypair for the signatures account (needed for signing close transaction).
+    pub keypair: Keypair,
+    /// The public key of the signatures account.
+    pub pubkey: Pubkey,
+}
+
+/// Post guardian signatures to the verify VAA shim.
+///
+/// This creates a new signatures account containing the guardian signatures,
+/// which can then be used with `verify_hash` CPI in your program.
+///
+/// Returns the keypair for the signatures account, which you'll need to close it later.
+pub fn post_signatures(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    guardian_set_index: u32,
+    signatures: &[[u8; 66]],
+) -> Result<PostedSignatures, WormholeTestError> {
+    let guardian_sigs_keypair = Keypair::new();
+
+    let ix = PostSignatures {
+        program_id: &VERIFY_VAA_SHIM_PROGRAM_ID,
+        accounts: PostSignaturesAccounts {
+            payer: &payer.pubkey(),
+            guardian_signatures: &guardian_sigs_keypair.pubkey(),
+        },
+        data: PostSignaturesData::new(guardian_set_index, signatures.len() as u8, signatures),
+    }
+    .instruction();
+
+    let blockhash = svm.latest_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer, &guardian_sigs_keypair],
+        blockhash,
+    );
+
+    svm.send_transaction(tx)
+        .map_err(|e| WormholeTestError::LoadError(format!("post_signatures failed: {:?}", e)))?;
+
+    Ok(PostedSignatures {
+        pubkey: guardian_sigs_keypair.pubkey(),
+        keypair: guardian_sigs_keypair,
+    })
+}
+
+/// Close a guardian signatures account to reclaim rent.
+///
+/// The refund is sent to the specified recipient.
+pub fn close_signatures(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    signatures_pubkey: &Pubkey,
+    refund_recipient: &Pubkey,
+) -> Result<(), WormholeTestError> {
+    let ix = CloseSignatures {
+        program_id: &VERIFY_VAA_SHIM_PROGRAM_ID,
+        accounts: CloseSignaturesAccounts {
+            guardian_signatures: signatures_pubkey,
+            refund_recipient,
+        },
+    }
+    .instruction();
+
+    let blockhash = svm.latest_blockhash();
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], blockhash);
+
+    svm.send_transaction(tx)
+        .map_err(|e| WormholeTestError::LoadError(format!("close_signatures failed: {:?}", e)))?;
+
+    Ok(())
+}
+
+/// Execute a closure with posted signatures, automatically handling post and close.
+///
+/// This is a "bracket" pattern that:
+/// 1. Posts the guardian signatures to the verify shim
+/// 2. Calls your closure with the signatures account pubkey
+/// 3. Closes the signatures account to reclaim rent
+///
+/// # Example
+///
+/// ```ignore
+/// with_posted_signatures(
+///     &mut svm,
+///     &payer,
+///     0,
+///     &signatures,
+///     |sigs_pubkey| {
+///         // Build and send your transaction that uses verify_hash CPI
+///         let ix = build_my_instruction(&sigs_pubkey);
+///         let tx = Transaction::new_signed_with_payer(...);
+///         svm.send_transaction(tx)
+///     },
+/// )?;
+/// ```
+pub fn with_posted_signatures<F, T, E>(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    guardian_set_index: u32,
+    signatures: &[[u8; 66]],
+    f: F,
+) -> Result<T, WormholeTestError>
+where
+    F: FnOnce(&mut LiteSVM, &Pubkey) -> Result<T, E>,
+    E: std::fmt::Display,
+{
+    // Step 1: Post signatures
+    let posted = post_signatures(svm, payer, guardian_set_index, signatures)?;
+
+    // Step 2: Run user's closure
+    let result = f(svm, &posted.pubkey)
+        .map_err(|e| WormholeTestError::LoadError(format!("user closure failed: {}", e)))?;
+
+    // Step 3: Close signatures account
+    close_signatures(svm, payer, &posted.pubkey, &payer.pubkey())?;
+
+    Ok(result)
+}
+
+/// Build a post_signatures instruction without sending it.
+///
+/// Useful if you need to combine this with other instructions in a single transaction.
+pub fn build_post_signatures_ix(
+    payer: &Pubkey,
+    guardian_signatures_keypair: &Pubkey,
+    guardian_set_index: u32,
+    signatures: &[[u8; 66]],
+) -> Instruction {
+    PostSignatures {
+        program_id: &VERIFY_VAA_SHIM_PROGRAM_ID,
+        accounts: PostSignaturesAccounts {
+            payer,
+            guardian_signatures: guardian_signatures_keypair,
+        },
+        data: PostSignaturesData::new(guardian_set_index, signatures.len() as u8, signatures),
+    }
+    .instruction()
+}
+
+/// Build a close_signatures instruction without sending it.
+///
+/// Useful if you need to combine this with other instructions in a single transaction.
+pub fn build_close_signatures_ix(
+    guardian_signatures: &Pubkey,
+    refund_recipient: &Pubkey,
+) -> Instruction {
+    CloseSignatures {
+        program_id: &VERIFY_VAA_SHIM_PROGRAM_ID,
+        accounts: CloseSignaturesAccounts {
+            guardian_signatures,
+            refund_recipient,
+        },
+    }
+    .instruction()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +570,99 @@ mod tests {
         assert_eq!(&VERIFY_VAA_SHIM_BYTES[0..4], &[0x7f, b'E', b'L', b'F']);
         assert_eq!(&CORE_BRIDGE_BYTES[0..4], &[0x7f, b'E', b'L', b'F']);
         assert_eq!(&POST_MESSAGE_SHIM_BYTES[0..4], &[0x7f, b'E', b'L', b'F']);
+    }
+
+    #[cfg(feature = "bundled-fixtures")]
+    #[test]
+    fn test_post_and_close_signatures() {
+        use crate::TestVaa;
+
+        let mut svm = LiteSVM::new();
+        let guardians = TestGuardianSet::single(TestGuardian::default());
+        let payer = Keypair::new();
+
+        // Fund payer
+        svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+
+        // Setup wormhole
+        setup_wormhole(&mut svm, &guardians, 0, WormholeProgramsConfig::default()).unwrap();
+
+        // Create a test VAA and get signatures
+        let vaa = TestVaa::new(1, [0xAB; 32], 42, vec![1, 2, 3, 4]);
+        let signatures = vaa.guardian_signatures(&guardians);
+
+        // Convert to array format
+        let sig_arrays: Vec<[u8; 66]> = signatures;
+
+        // Post signatures
+        let posted = post_signatures(&mut svm, &payer, 0, &sig_arrays).unwrap();
+
+        // Verify signatures account exists
+        let sigs_account = svm.get_account(&posted.pubkey);
+        assert!(sigs_account.is_some(), "Signatures account should exist");
+
+        // Close signatures
+        close_signatures(&mut svm, &payer, &posted.pubkey, &payer.pubkey()).unwrap();
+
+        // Verify signatures account is closed
+        let sigs_account = svm.get_account(&posted.pubkey);
+        assert!(
+            sigs_account.is_none(),
+            "Signatures account should be closed"
+        );
+    }
+
+    #[cfg(feature = "bundled-fixtures")]
+    #[test]
+    fn test_with_posted_signatures_bracket() {
+        use crate::TestVaa;
+
+        let mut svm = LiteSVM::new();
+        let guardians = TestGuardianSet::single(TestGuardian::default());
+        let payer = Keypair::new();
+
+        // Fund payer
+        svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+
+        // Setup wormhole
+        setup_wormhole(&mut svm, &guardians, 0, WormholeProgramsConfig::default()).unwrap();
+
+        // Create a test VAA and get signatures
+        let vaa = TestVaa::new(1, [0xAB; 32], 42, vec![1, 2, 3, 4]);
+        let signatures = vaa.guardian_signatures(&guardians);
+        let sig_arrays: Vec<[u8; 66]> = signatures;
+
+        // Track the signatures pubkey for verification after closure
+        let mut captured_pubkey: Option<Pubkey> = None;
+
+        // Use bracket pattern
+        let result = with_posted_signatures(
+            &mut svm,
+            &payer,
+            0,
+            &sig_arrays,
+            |svm, sigs_pubkey| -> Result<(), &'static str> {
+                // Capture the pubkey for later verification
+                captured_pubkey = Some(*sigs_pubkey);
+
+                // Verify the signatures account exists inside the closure
+                let account = svm.get_account(sigs_pubkey);
+                if account.is_some() {
+                    Ok(())
+                } else {
+                    Err("signatures account not found inside closure")
+                }
+            },
+        );
+
+        assert!(result.is_ok(), "with_posted_signatures failed: {:?}", result);
+
+        // Verify the signatures account was closed after the bracket
+        let pubkey = captured_pubkey.expect("pubkey should have been captured");
+        let account = svm.get_account(&pubkey);
+        assert!(
+            account.is_none(),
+            "Signatures account should be closed after bracket"
+        );
     }
 }
