@@ -7,6 +7,7 @@ Testing utilities for Solana programs integrating with Wormhole.
 - **Guardian signing**: Create test guardians with configurable keys, sign VAA bodies
 - **VAA construction**: Build and sign VAAs for testing
 - **LiteSVM integration** (optional): Load Wormhole programs and set up guardian accounts
+- **Bundled fixtures** (optional): Pre-bundled mainnet program binaries for zero-setup testing
 
 ## Usage
 
@@ -27,13 +28,13 @@ let signed_vaa = vaa.sign(&guardians);
 let signatures = vaa.guardian_signatures(&guardians);
 ```
 
-### With LiteSVM
+### With LiteSVM (Recommended)
 
-Enable the `litesvm` feature:
+Use the `bundled-fixtures` feature for zero-setup testing:
 
 ```toml
 [dev-dependencies]
-wormhole-svm-test = { version = "0.1", features = ["litesvm"] }
+wormhole-svm-test = { version = "0.1", features = ["bundled-fixtures"] }
 ```
 
 ```rust
@@ -56,20 +57,25 @@ let wormhole = setup_wormhole(
 // wormhole.guardian_set is the PDA address
 ```
 
-## Obtaining Wormhole Program Binaries
+### Without Bundled Fixtures
 
-The LiteSVM helpers require Wormhole program binaries. Dump them from mainnet:
+If you prefer to manage your own binaries, use just the `litesvm` feature:
+
+```toml
+[dev-dependencies]
+wormhole-svm-test = { version = "0.1", features = ["litesvm"] }
+```
+
+Then dump the programs from mainnet:
 
 ```bash
-solana account -u mainnet \
+solana program dump --url https://api.mainnet-beta.solana.com \
     HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ \
-    --output-file fixtures/verify_vaa_shim.so \
-    --output json-compact
+    fixtures/verify_vaa_shim.so
 
-solana account -u mainnet \
+solana program dump --url https://api.mainnet-beta.solana.com \
     worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth \
-    --output-file fixtures/core_bridge.so \
-    --output json-compact
+    fixtures/core_bridge.so
 ```
 
 Or set `WORMHOLE_FIXTURES_DIR` to point to existing binaries.

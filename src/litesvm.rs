@@ -12,6 +12,14 @@ use wormhole_svm_definitions::{
 
 use crate::TestGuardianSet;
 
+/// Bundled Wormhole Verify VAA Shim program binary (mainnet).
+#[cfg(feature = "bundled-fixtures")]
+pub const VERIFY_VAA_SHIM_BYTES: &[u8] = include_bytes!("../fixtures/verify_vaa_shim.so");
+
+/// Bundled Wormhole Core Bridge program binary (mainnet).
+#[cfg(feature = "bundled-fixtures")]
+pub const CORE_BRIDGE_BYTES: &[u8] = include_bytes!("../fixtures/core_bridge.so");
+
 /// Errors that can occur when setting up Wormhole in LiteSVM.
 #[derive(Error, Debug)]
 pub enum WormholeTestError {
@@ -52,17 +60,21 @@ pub struct WormholeAccounts {
     pub guardian_set_bump: u8,
 }
 
-const PROGRAM_NOT_FOUND_HELP: &str = r#"Wormhole program binaries not found. Dump them from mainnet:
+const PROGRAM_NOT_FOUND_HELP: &str = r#"Wormhole program binaries not found.
 
-    solana account -u mainnet \
+Enable the `bundled-fixtures` feature to use pre-bundled mainnet binaries:
+
+    wormhole-svm-test = { version = "0.1", features = ["bundled-fixtures"] }
+
+Or dump them from mainnet yourself:
+
+    solana program dump --url https://api.mainnet-beta.solana.com \
         HDwcJBJXjL9FpJ7UBsYBtaDjsBUhuLCUYoz3zr8SWWaQ \
-        --output-file fixtures/verify_vaa_shim.so \
-        --output json-compact
+        fixtures/verify_vaa_shim.so
 
-    solana account -u mainnet \
+    solana program dump --url https://api.mainnet-beta.solana.com \
         worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth \
-        --output-file fixtures/core_bridge.so \
-        --output json-compact
+        fixtures/core_bridge.so
 
 Or set WORMHOLE_FIXTURES_DIR environment variable to point to existing binaries."#;
 
@@ -83,24 +95,8 @@ fn search_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Find a program binary file.
-fn find_program_file(
-    filename: &str,
-    explicit_path: Option<&PathBuf>,
-) -> Result<PathBuf, WormholeTestError> {
-    // Use explicit path if provided
-    if let Some(path) = explicit_path {
-        if path.exists() {
-            return Ok(path.clone());
-        }
-        return Err(WormholeTestError::ProgramNotFound {
-            program: filename.to_string(),
-            searched: vec![path.clone()],
-            help: PROGRAM_NOT_FOUND_HELP.to_string(),
-        });
-    }
-
-    // Search default locations
+/// Find a program binary file in default search locations.
+fn find_program_file(filename: &str) -> Result<PathBuf, WormholeTestError> {
     let search = search_paths();
     for dir in &search {
         let path = dir.join(filename);
@@ -117,23 +113,66 @@ fn find_program_file(
 }
 
 /// Load Wormhole programs into an existing LiteSVM instance.
+///
+/// With the `bundled-fixtures` feature enabled, programs are loaded from
+/// bundled binaries by default. You can still override with explicit paths.
 pub fn load_wormhole_programs(
     svm: &mut LiteSVM,
     config: WormholeProgramsConfig,
 ) -> Result<(), WormholeTestError> {
     // Load Verify VAA Shim
-    let shim_path = find_program_file("verify_vaa_shim.so", config.verify_vaa_shim.as_ref())?;
-    let shim_bytes = std::fs::read(&shim_path)?;
+    let shim_bytes = get_program_bytes(
+        "verify_vaa_shim.so",
+        config.verify_vaa_shim.as_ref(),
+        #[cfg(feature = "bundled-fixtures")]
+        Some(VERIFY_VAA_SHIM_BYTES),
+        #[cfg(not(feature = "bundled-fixtures"))]
+        None,
+    )?;
     svm.add_program(VERIFY_VAA_SHIM_PROGRAM_ID, &shim_bytes)
         .map_err(|e| WormholeTestError::LoadError(format!("verify_vaa_shim: {}", e)))?;
 
     // Load Core Bridge
-    let bridge_path = find_program_file("core_bridge.so", config.core_bridge.as_ref())?;
-    let bridge_bytes = std::fs::read(&bridge_path)?;
+    let bridge_bytes = get_program_bytes(
+        "core_bridge.so",
+        config.core_bridge.as_ref(),
+        #[cfg(feature = "bundled-fixtures")]
+        Some(CORE_BRIDGE_BYTES),
+        #[cfg(not(feature = "bundled-fixtures"))]
+        None,
+    )?;
     svm.add_program(CORE_BRIDGE_PROGRAM_ID, &bridge_bytes)
         .map_err(|e| WormholeTestError::LoadError(format!("core_bridge: {}", e)))?;
 
     Ok(())
+}
+
+/// Get program bytes from explicit path, bundled bytes, or file search.
+fn get_program_bytes(
+    filename: &str,
+    explicit_path: Option<&PathBuf>,
+    bundled: Option<&'static [u8]>,
+) -> Result<Vec<u8>, WormholeTestError> {
+    // Explicit path takes priority
+    if let Some(path) = explicit_path {
+        if path.exists() {
+            return Ok(std::fs::read(path)?);
+        }
+        return Err(WormholeTestError::ProgramNotFound {
+            program: filename.to_string(),
+            searched: vec![path.clone()],
+            help: PROGRAM_NOT_FOUND_HELP.to_string(),
+        });
+    }
+
+    // Try bundled bytes if available
+    if let Some(bytes) = bundled {
+        return Ok(bytes.to_vec());
+    }
+
+    // Fall back to file search
+    let path = find_program_file(filename)?;
+    Ok(std::fs::read(&path)?)
 }
 
 /// Create a guardian set account in LiteSVM.
@@ -290,5 +329,45 @@ mod tests {
         let paths = search_paths();
         assert!(paths.iter().any(|p| p == Path::new("/custom/path")));
         std::env::remove_var("WORMHOLE_FIXTURES_DIR");
+    }
+
+    #[cfg(feature = "bundled-fixtures")]
+    #[test]
+    fn test_setup_wormhole_with_bundled_fixtures() {
+        let mut svm = LiteSVM::new();
+        let guardians = TestGuardianSet::single(TestGuardian::default());
+
+        let result = setup_wormhole(&mut svm, &guardians, 0, WormholeProgramsConfig::default());
+
+        assert!(result.is_ok(), "setup_wormhole failed: {:?}", result.err());
+
+        let accounts = result.unwrap();
+
+        // Verify guardian set account was created
+        let guardian_set_account = svm.get_account(&accounts.guardian_set);
+        assert!(
+            guardian_set_account.is_some(),
+            "Guardian set account not found"
+        );
+
+        // Verify bridge config was created
+        let config_account = svm.get_account(&CORE_BRIDGE_CONFIG);
+        assert!(config_account.is_some(), "Bridge config account not found");
+
+        // Verify programs were loaded
+        let shim_account = svm.get_account(&VERIFY_VAA_SHIM_PROGRAM_ID);
+        assert!(shim_account.is_some(), "Verify VAA shim not loaded");
+
+        let bridge_account = svm.get_account(&CORE_BRIDGE_PROGRAM_ID);
+        assert!(bridge_account.is_some(), "Core bridge not loaded");
+    }
+
+    #[cfg(feature = "bundled-fixtures")]
+    #[test]
+    fn test_bundled_fixtures_are_valid_elf() {
+        // Verify the bundled fixtures are valid ELF binaries
+        // ELF magic number: 0x7f 'E' 'L' 'F'
+        assert_eq!(&VERIFY_VAA_SHIM_BYTES[0..4], &[0x7f, b'E', b'L', b'F']);
+        assert_eq!(&CORE_BRIDGE_BYTES[0..4], &[0x7f, b'E', b'L', b'F']);
     }
 }
