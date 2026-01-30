@@ -2,6 +2,7 @@
 members = [
     "crates/wormhole-svm-test",
     "programs/vaa-verifier-example",
+    "programs/message-emitter-example",
 ]
 resolver = "2"
 

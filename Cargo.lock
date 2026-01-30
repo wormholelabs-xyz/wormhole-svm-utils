@@ -1751,6 +1751,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "message-emitter-example"
+version = "0.1.0"
+dependencies = [
+ "solana-program",
+ "wormhole-svm-definitions",
+ "wormhole-svm-shim",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

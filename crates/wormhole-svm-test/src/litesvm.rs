@@ -648,6 +648,206 @@ pub fn build_close_signatures_ix(
     .instruction()
 }
 
+// =============================================================================
+// Posted Message Capture and VAA Construction
+// =============================================================================
+
+/// Discriminator for the MessageEvent anchor event.
+/// This is sha256("event:MessageEvent")[0..8]
+const MESSAGE_EVENT_DISCRIMINATOR: [u8; 8] = wormhole_svm_definitions::MESSAGE_EVENT_DISCRIMINATOR;
+
+/// Discriminator for the post_message instruction.
+/// This is sha256("global:post_message")[0..8]
+const POST_MESSAGE_SELECTOR: [u8; 8] =
+    wormhole_svm_shim::post_message::PostMessageShimInstruction::<u8>::POST_MESSAGE_SELECTOR;
+
+// Internal: Parsed post_message instruction data.
+#[derive(Clone, Debug)]
+struct PostMessageData {
+    nonce: u32,
+    finality: u8,
+    payload: Vec<u8>,
+}
+
+impl PostMessageData {
+    fn parse(data: &[u8]) -> Option<Self> {
+        // Format: 8 (disc) + 4 (nonce) + 1 (finality) + 4 (len) + payload
+        if data.len() < 17 || &data[..8] != &POST_MESSAGE_SELECTOR {
+            return None;
+        }
+        let nonce = u32::from_le_bytes(data[8..12].try_into().ok()?);
+        let finality = data[12];
+        let payload_len = u32::from_le_bytes(data[13..17].try_into().ok()?) as usize;
+        if data.len() < 17 + payload_len {
+            return None;
+        }
+        Some(Self {
+            nonce,
+            finality,
+            payload: data[17..17 + payload_len].to_vec(),
+        })
+    }
+}
+
+// Internal: Parsed MessageEvent from the Post Message Shim's self-CPI.
+#[derive(Clone, Debug)]
+struct MessageEvent {
+    emitter: Pubkey,
+    sequence: u64,
+    submission_time: u32,
+}
+
+impl MessageEvent {
+    fn parse(data: &[u8]) -> Option<Self> {
+        // Format: 8 (cpi disc) + 8 (event disc) + 32 (emitter) + 8 (seq) + 4 (time)
+        if data.len() < 60 || &data[8..16] != &MESSAGE_EVENT_DISCRIMINATOR {
+            return None;
+        }
+        let event_data = &data[16..];
+        Some(Self {
+            emitter: Pubkey::new_from_array(event_data[..32].try_into().ok()?),
+            sequence: u64::from_le_bytes(event_data[32..40].try_into().ok()?),
+            submission_time: u32::from_le_bytes(event_data[40..44].try_into().ok()?),
+        })
+    }
+}
+
+/// Information about a posted Wormhole message.
+///
+/// This struct captures all the data needed to construct a VAA from a
+/// message that was posted via the Wormhole Post Message Shim.
+///
+/// It combines the MessageEvent (captured from CPI) with the original
+/// call parameters (payload, nonce, finality).
+#[derive(Clone, Debug)]
+pub struct PostedMessageInfo {
+    /// The emitter address (the PDA that signed the message).
+    pub emitter: Pubkey,
+    /// The emitter chain ID (1 for Solana).
+    pub emitter_chain: u16,
+    /// The sequence number of the message.
+    pub sequence: u64,
+    /// The message payload.
+    pub payload: Vec<u8>,
+    /// The nonce.
+    pub nonce: u32,
+    /// The consistency level (finality).
+    pub consistency_level: u8,
+    /// The timestamp (submission time from the event).
+    pub timestamp: u32,
+}
+
+impl PostedMessageInfo {
+    // Internal: Create from parsed event and post_message data.
+    fn from_event(
+        event: &MessageEvent,
+        payload: Vec<u8>,
+        nonce: u32,
+        consistency_level: u8,
+    ) -> Self {
+        Self {
+            emitter: event.emitter,
+            emitter_chain: 1, // Solana
+            sequence: event.sequence,
+            payload,
+            nonce,
+            consistency_level,
+            timestamp: event.submission_time,
+        }
+    }
+
+    /// Convert this posted message to a TestVaa.
+    ///
+    /// The resulting TestVaa can be signed by guardians to produce a verifiable VAA.
+    pub fn to_test_vaa(&self) -> crate::TestVaa {
+        crate::TestVaa {
+            emitter_chain: self.emitter_chain,
+            emitter_address: self.emitter.to_bytes(),
+            sequence: self.sequence,
+            payload: self.payload.clone(),
+            timestamp: self.timestamp,
+            nonce: self.nonce,
+            consistency_level: self.consistency_level,
+            guardian_set_index: 0,
+        }
+    }
+}
+
+/// Extract all Wormhole messages from transaction inner instructions.
+///
+/// A single transaction can emit multiple Wormhole messages. This function extracts
+/// all of them by parsing:
+/// - The `post_message` CPI instructions (for nonce, finality, payload)
+/// - The `MessageEvent` self-CPI events (for emitter, sequence, timestamp)
+///
+/// These are paired up in order - the Nth post_message corresponds to the Nth MessageEvent.
+///
+/// # Example
+///
+/// ```ignore
+/// // Send a transaction that emits one or more Wormhole messages
+/// let tx_meta = svm.send_transaction(tx)?;
+///
+/// // Extract all messages
+/// let messages = extract_posted_message_info_from_tx(&tx_meta);
+///
+/// for message_info in messages {
+///     let vaa = message_info.to_test_vaa();
+///     let signed_vaa = vaa.sign(&guardians);
+/// }
+/// ```
+///
+/// Returns an empty Vec if no messages are found.
+pub fn extract_posted_message_info_from_tx(
+    meta: &litesvm::types::TransactionMetadata,
+) -> Vec<PostedMessageInfo> {
+    // Collect all post_message instructions and MessageEvents from inner instructions
+    let mut post_messages = Vec::new();
+    let mut events = Vec::new();
+
+    for inner_list in &meta.inner_instructions {
+        for inner in inner_list {
+            if let Some(data) = PostMessageData::parse(&inner.instruction.data) {
+                post_messages.push(data);
+            }
+            if let Some(event) = MessageEvent::parse(&inner.instruction.data) {
+                events.push(event);
+            }
+        }
+    }
+
+    // Pair them up - they should appear in the same order
+    post_messages
+        .into_iter()
+        .zip(events.into_iter())
+        .map(|(post_msg, event)| {
+            PostedMessageInfo::from_event(
+                &event,
+                post_msg.payload,
+                post_msg.nonce,
+                post_msg.finality,
+            )
+        })
+        .collect()
+}
+
+/// Read the current sequence number for an emitter from its sequence account.
+///
+/// Returns `None` if the sequence account doesn't exist yet (first message not posted).
+pub fn read_emitter_sequence(svm: &LiteSVM, emitter: &Pubkey) -> Option<u64> {
+    use wormhole_svm_definitions::find_emitter_sequence_address;
+
+    let (sequence_addr, _) = find_emitter_sequence_address(emitter, &CORE_BRIDGE_PROGRAM_ID);
+    let account = svm.get_account(&sequence_addr)?;
+
+    // Sequence account data is just a u64 (little-endian)
+    if account.data.len() >= 8 {
+        Some(u64::from_le_bytes(account.data[0..8].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +1038,80 @@ mod tests {
         );
     }
 
-    // Note: with_vaa and with_vaa_unchecked are tested in the integration tests
-    // (tests/verify_vaa_example.rs) which use a real program that verifies VAAs.
+    // Note: with_vaa, with_vaa_unchecked, and message emission are tested in
+    // integration tests (tests/verify_vaa_example.rs and tests/emit_message_example.rs).
+
+    #[test]
+    fn test_message_event_parsing() {
+        // Test parsing MessageEvent from raw bytes
+        let emitter = Pubkey::new_unique();
+        let sequence = 42u64;
+        let submission_time = 1234567890u32;
+
+        // Build the event data manually in the Anchor self-CPI format:
+        // - 8 bytes: Anchor self-CPI instruction discriminator (any value)
+        // - 8 bytes: MessageEvent event discriminator
+        // - borsh-encoded event data
+        let mut data = Vec::new();
+        // Outer CPI discriminator (any 8 bytes - Anchor's internal discriminator)
+        data.extend_from_slice(&[228, 69, 165, 46, 81, 203, 154, 29]);
+        // MessageEvent discriminator
+        data.extend_from_slice(&MESSAGE_EVENT_DISCRIMINATOR);
+        // Event data
+        data.extend_from_slice(&emitter.to_bytes());
+        data.extend_from_slice(&sequence.to_le_bytes());
+        data.extend_from_slice(&submission_time.to_le_bytes());
+
+        // Parse it back
+        let event = MessageEvent::parse(&data).expect("should parse");
+        assert_eq!(event.emitter, emitter);
+        assert_eq!(event.sequence, sequence);
+        assert_eq!(event.submission_time, submission_time);
+
+        // Test with wrong event discriminator (corrupt bytes 8-15)
+        let mut bad_data = data.clone();
+        bad_data[8] = 0xFF;
+        assert!(MessageEvent::parse(&bad_data).is_none());
+
+        // Test with truncated data
+        assert!(MessageEvent::parse(&data[..20]).is_none());
+    }
+
+    #[test]
+    fn test_post_message_data_parsing() {
+        // Test parsing PostMessageData from raw instruction data
+        let nonce = 12345u32;
+        let finality = 1u8;
+        let payload = b"Test payload for parsing";
+
+        // Build the instruction data manually:
+        // - 8 bytes: POST_MESSAGE_SELECTOR discriminator
+        // - 4 bytes: nonce (LE)
+        // - 1 byte: finality
+        // - 4 bytes: payload_len (LE)
+        // - N bytes: payload
+        let mut data = Vec::new();
+        data.extend_from_slice(&POST_MESSAGE_SELECTOR);
+        data.extend_from_slice(&nonce.to_le_bytes());
+        data.push(finality);
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(payload);
+
+        // Parse it back
+        let parsed = PostMessageData::parse(&data).expect("should parse");
+        assert_eq!(parsed.nonce, nonce);
+        assert_eq!(parsed.finality, finality);
+        assert_eq!(parsed.payload, payload);
+
+        // Test with wrong discriminator
+        let mut bad_data = data.clone();
+        bad_data[0] = 0xFF;
+        assert!(PostMessageData::parse(&bad_data).is_none());
+
+        // Test with truncated data (no payload)
+        assert!(PostMessageData::parse(&data[..17]).is_none());
+
+        // Test with truncated header
+        assert!(PostMessageData::parse(&data[..10]).is_none());
+    }
 }

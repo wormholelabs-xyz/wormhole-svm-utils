@@ -349,3 +349,224 @@ fn test_with_posted_signatures_pattern() {
     assert!(result.is_ok(), "Bracket pattern test failed: {:?}", result);
     println!("Bracket pattern test complete!");
 }
+
+/// Test the full emit → capture → verify cycle.
+///
+/// This demonstrates the complete guardian workflow:
+/// 1. A program emits a Wormhole message via the Post Message Shim
+/// 2. We capture the MessageEvent from the transaction's inner instructions
+/// 3. We construct a VAA from the captured event (simulating guardian signing)
+/// 4. Another program verifies that VAA
+///
+/// This is the core workflow for cross-chain messaging: messages are emitted
+/// on the source chain, guardians observe and sign them, and the resulting
+/// VAAs are verified on the destination chain.
+///
+/// NOTE: This test manually loads the message-emitter-example program to demonstrate
+/// the generic `extract_posted_message_info_from_tx` API that integrators should use
+/// with their own programs. This single function extracts both the MessageEvent and
+/// the post_message instruction data (payload, nonce, finality) automatically.
+#[test]
+fn test_emit_capture_verify_roundtrip() {
+    use solana_sdk::instruction::{AccountMeta, Instruction};
+    use solana_sdk::pubkey::Pubkey;
+    use wormhole_svm_definitions::{
+        find_core_bridge_config_address, find_emitter_sequence_address,
+        find_event_authority_address, find_fee_collector_address, find_shim_message_address,
+        solana::mainnet::{CORE_BRIDGE_PROGRAM_ID, POST_MESSAGE_SHIM_PROGRAM_ID},
+    };
+    use wormhole_svm_test::{extract_posted_message_info_from_tx, with_posted_signatures};
+
+    // Message emitter example program ID (from the program's declare_id!)
+    const MESSAGE_EMITTER_ID: Pubkey =
+        solana_sdk::pubkey!("26g7Z38n86MGtturwtHuWKG3hr4QhvnaBfinaFKVaz4x");
+
+    // Helper to find emitter PDA for the message-emitter-example program
+    fn find_emitter_address() -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"emitter"], &MESSAGE_EMITTER_ID)
+    }
+
+    // Helper to load the message-emitter-example program
+    fn load_message_emitter(svm: &mut LiteSVM) {
+        let search_paths = [
+            "target/deploy",
+            "../target/deploy",
+            "../../target/deploy",
+            "../../../target/deploy",
+        ];
+        for base in &search_paths {
+            let path = format!("{}/message_emitter_example.so", base);
+            if Path::new(&path).exists() {
+                let bytes = std::fs::read(&path).expect("read program");
+                svm.add_program(MESSAGE_EMITTER_ID, &bytes)
+                    .expect("load program");
+                return;
+            }
+        }
+        panic!("message_emitter_example.so not found");
+    }
+
+    // Helper to build emit_message instruction
+    fn build_emit_ix(payer: &Pubkey, nonce: u32, finality: u8, payload: &[u8]) -> Instruction {
+        let (emitter, _) = find_emitter_address();
+        let (core_bridge_config, _) = find_core_bridge_config_address(&CORE_BRIDGE_PROGRAM_ID);
+        let (message, _) = find_shim_message_address(&emitter, &POST_MESSAGE_SHIM_PROGRAM_ID);
+        let (sequence, _) = find_emitter_sequence_address(&emitter, &CORE_BRIDGE_PROGRAM_ID);
+        let (fee_collector, _) = find_fee_collector_address(&CORE_BRIDGE_PROGRAM_ID);
+        let (event_authority, _) = find_event_authority_address(&POST_MESSAGE_SHIM_PROGRAM_ID);
+
+        let mut data = Vec::with_capacity(9 + payload.len());
+        data.extend_from_slice(&nonce.to_le_bytes());
+        data.push(finality);
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(payload);
+
+        Instruction {
+            program_id: MESSAGE_EMITTER_ID,
+            accounts: vec![
+                AccountMeta::new(core_bridge_config, false),
+                AccountMeta::new(message, false),
+                AccountMeta::new_readonly(emitter, false),
+                AccountMeta::new(sequence, false),
+                AccountMeta::new(*payer, true),
+                AccountMeta::new(fee_collector, false),
+                AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(CORE_BRIDGE_PROGRAM_ID, false),
+                AccountMeta::new_readonly(event_authority, false),
+                AccountMeta::new_readonly(POST_MESSAGE_SHIM_PROGRAM_ID, false),
+            ],
+            data,
+        }
+    }
+
+    let mut svm = LiteSVM::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let guardians = TestGuardianSet::single(TestGuardian::default());
+
+    // Step 1: Set up Wormhole programs and accounts
+    let wormhole = setup_wormhole(
+        &mut svm,
+        &guardians,
+        GUARDIAN_SET_INDEX,
+        WormholeProgramsConfig::default(),
+    )
+    .expect("Failed to setup Wormhole");
+
+    // Step 2: Load both example programs
+    load_example_program(&mut svm); // vaa-verifier-example
+    load_message_emitter(&mut svm); // message-emitter-example
+
+    println!("=== Emit → Capture → Verify Round-trip Test ===\n");
+
+    // Step 3: Emit a Wormhole message via the Post Message Shim
+    let payload = b"Cross-chain message from Solana!";
+    let nonce = 12345u32;
+    let finality = 1u8; // Confirmed
+
+    println!("Step 1: Emitting message via Post Message Shim...");
+    let emit_ix = build_emit_ix(&payer.pubkey(), nonce, finality, payload);
+    let blockhash = svm.latest_blockhash();
+    let tx =
+        Transaction::new_signed_with_payer(&[emit_ix], Some(&payer.pubkey()), &[&payer], blockhash);
+    let tx_meta = svm.send_transaction(tx).expect("emit should succeed");
+
+    // Step 4: Capture everything automatically using the combined extraction helper
+    // This extracts both the MessageEvent AND the post_message instruction data
+    // (payload, nonce, finality) from the transaction's inner instructions
+    let message_info = extract_posted_message_info_from_tx(&tx_meta)
+        .into_iter()
+        .next()
+        .expect("PostedMessageInfo should be extractable from transaction");
+
+    println!("  Captured from CPI inner instructions:");
+    println!("    Emitter: {}", message_info.emitter);
+    println!("    Sequence: {}", message_info.sequence);
+    println!(
+        "    Payload: {:?}",
+        String::from_utf8_lossy(&message_info.payload)
+    );
+    println!("    Nonce: {}", message_info.nonce);
+    println!("    Finality: {}", message_info.consistency_level);
+
+    // Verify the emitter is the expected PDA
+    let (expected_emitter, _) = find_emitter_address();
+    assert_eq!(message_info.emitter, expected_emitter);
+
+    // Verify the extracted values match what we sent
+    assert_eq!(message_info.payload, payload);
+    assert_eq!(message_info.nonce, nonce);
+    assert_eq!(message_info.consistency_level, finality);
+
+    // Step 5: Construct a VAA from the captured info (simulating guardian signing)
+    println!("\nStep 2: Constructing VAA from captured message info...");
+    let test_vaa = message_info.to_test_vaa();
+
+    println!("  VAA body:");
+    println!("    Emitter chain: {}", test_vaa.emitter_chain);
+    println!(
+        "    Emitter address: {}",
+        hex::encode(test_vaa.emitter_address)
+    );
+    println!("    Sequence: {}", test_vaa.sequence);
+    println!("    Nonce: {}", test_vaa.nonce);
+    println!("    Consistency level: {}", test_vaa.consistency_level);
+    println!(
+        "    Payload: {:?}",
+        String::from_utf8_lossy(&test_vaa.payload)
+    );
+
+    // Step 6: Sign the VAA with guardians
+    let guardian_signatures = test_vaa.guardian_signatures(&guardians);
+    println!(
+        "\nStep 3: Signed VAA with {} guardian(s)",
+        guardian_signatures.len()
+    );
+
+    // Step 7: Verify the VAA using the vaa-verifier-example program
+    println!("\nStep 4: Verifying VAA in destination program...");
+    let vaa_body = test_vaa.body();
+
+    let verify_result = with_posted_signatures(
+        &mut svm,
+        &payer,
+        GUARDIAN_SET_INDEX,
+        &guardian_signatures,
+        |svm, sigs_pubkey| -> Result<(), String> {
+            let verify_ix = vaa_verifier_example::build_verify_vaa_instruction(
+                &payer.pubkey(),
+                &wormhole.guardian_set,
+                sigs_pubkey,
+                wormhole.guardian_set_bump,
+                &vaa_body,
+            );
+
+            let blockhash = svm.latest_blockhash();
+            let tx = Transaction::new_signed_with_payer(
+                &[verify_ix],
+                Some(&payer.pubkey()),
+                &[&payer],
+                blockhash,
+            );
+
+            svm.send_transaction(tx)
+                .map_err(|e| format!("VAA verification failed: {:?}", e))?;
+
+            Ok(())
+        },
+    );
+
+    assert!(
+        verify_result.is_ok(),
+        "VAA verification should succeed: {:?}",
+        verify_result
+    );
+
+    println!("  VAA verified successfully!");
+    println!("\n=== Round-trip Complete ===");
+    println!(
+        "Message emitted on source chain → Captured by guardians → VAA verified on destination chain"
+    );
+}
