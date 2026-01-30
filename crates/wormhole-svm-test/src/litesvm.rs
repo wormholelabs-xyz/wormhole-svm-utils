@@ -241,16 +241,21 @@ pub fn create_guardian_set_account(
     (address, bump)
 }
 
-/// Create a minimal bridge config account in LiteSVM.
+/// Create a bridge config account in LiteSVM.
+///
+/// This creates a full bridge config that supports both VAA verification and message posting.
+///
+/// Bridge config data structure:
+/// - guardian_set_index: u32 (4 bytes, little-endian)
+/// - guardian_set_expiration_time: u32 (4 bytes)
+/// - fee: u64 (8 bytes)
+/// - last_lamports: u64 (8 bytes) - required for post_message
 pub fn create_bridge_config(svm: &mut LiteSVM, guardian_set_index: u32) {
-    // Minimal bridge config data structure:
-    // - guardian_set_index: u32 (4 bytes, little-endian)
-    // - guardian_set_expiration_time: u32 (4 bytes)
-    // - fee: u64 (8 bytes)
     let mut data = Vec::new();
     data.extend_from_slice(&guardian_set_index.to_le_bytes());
     data.extend_from_slice(&86400u32.to_le_bytes()); // 24 hour expiration
     data.extend_from_slice(&0u64.to_le_bytes()); // no fee
+    data.extend_from_slice(&0u64.to_le_bytes()); // last_lamports
 
     let rent = Rent::default();
     let lamports = rent.minimum_balance(data.len());
@@ -266,12 +271,32 @@ pub fn create_bridge_config(svm: &mut LiteSVM, guardian_set_index: u32) {
     svm.set_account(CORE_BRIDGE_CONFIG, account).unwrap();
 }
 
+/// Create the Wormhole fee collector account in LiteSVM.
+///
+/// The fee collector is needed for posting Wormhole messages.
+/// It's a simple system-owned account that receives bridge fees.
+pub fn create_fee_collector(svm: &mut LiteSVM) {
+    use wormhole_svm_definitions::solana::mainnet::CORE_BRIDGE_FEE_COLLECTOR;
+
+    let rent = Rent::default();
+    let account = Account {
+        lamports: rent.minimum_balance(0),
+        data: vec![],
+        owner: solana_sdk::system_program::ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+
+    svm.set_account(CORE_BRIDGE_FEE_COLLECTOR, account).unwrap();
+}
+
 /// Set up Wormhole in an existing LiteSVM instance.
 ///
 /// This is a convenience function that:
-/// 1. Loads Wormhole programs (Core Bridge + Verify VAA Shim)
+/// 1. Loads Wormhole programs (Core Bridge + Verify VAA Shim + Post Message Shim)
 /// 2. Creates a guardian set account
-/// 3. Creates a bridge config account
+/// 3. Creates a bridge config account (with full support for message posting)
+/// 4. Creates the fee collector account
 pub fn setup_wormhole(
     svm: &mut LiteSVM,
     guardians: &TestGuardianSet,
@@ -284,6 +309,7 @@ pub fn setup_wormhole(
         create_guardian_set_account(svm, guardians, guardian_set_index);
 
     create_bridge_config(svm, guardian_set_index);
+    create_fee_collector(svm);
 
     Ok(WormholeAccounts {
         guardian_set,
