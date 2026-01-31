@@ -61,15 +61,18 @@ let wormhole = setup_wormhole(
 ### Verifying VAAs (Recommended)
 
 Use `with_vaa` for the cleanest API. It automatically ensures your program actually
-verifies VAAs:
+verifies VAAs and (optionally) has replay protection:
 
 1. **Negative test (on cloned SVM)**: Clones the SVM, posts mismatched signatures, and
    executes your transaction. If it succeeds, returns `VerificationBypass` error - your
    program isn't verifying! (Clone is discarded, no state changes persist.)
 2. **Positive test (executed)**: Builds and sends your transaction with correct signatures.
+3. **Replay test (if `NonReplayable`)**: Clones the SVM after success, attempts to run the
+   transaction again with the same VAA. If it succeeds, returns `ReplayProtectionMissing`
+   error - your program lacks replay protection!
 
 ```rust
-use wormhole_svm_test::{with_vaa, TestVaa, emitter_address_from_20};
+use wormhole_svm_test::{with_vaa, TestVaa, emitter_address_from_20, ReplayProtection};
 
 let vaa = TestVaa::new(1, emitter_address_from_20([0xAB; 20]), 42, payload);
 
@@ -80,12 +83,38 @@ let result = with_vaa(
     &guardians,
     0, // guardian set index
     &vaa,
+    ReplayProtection::NonReplayable, // Verify replay protection
     |svm, sigs_pubkey, vaa_body| {
         let ix = build_my_verify_instruction(sigs_pubkey, vaa_body);
         let tx = Transaction::new_signed_with_payer(...);
         svm.send_transaction(tx).map_err(|e| format!("{:?}", e))
     },
 )?;
+```
+
+### Replay Protection
+
+The `ReplayProtection` parameter controls whether `with_vaa` verifies that your program
+cannot process the same VAA twice:
+
+- **`NonReplayable` (default)**: After successful execution, `with_vaa` attempts to replay
+  the same VAA. If the replay succeeds, your program lacks replay protection - a critical
+  security vulnerability. Consider using [solana-noreplay](https://crates.io/crates/solana-noreplay)
+  or similar mechanisms to mark VAAs as used.
+
+- **`Replayable`**: Skip the replay protection check. Use this for:
+  - Operations that are intentionally idempotent
+  - Testing error paths where you expect `VerificationBypass` before replay check
+  - Programs that handle replay protection through other means
+
+```rust
+use wormhole_svm_test::ReplayProtection;
+
+// For programs that MUST have replay protection (most cases):
+ReplayProtection::NonReplayable
+
+// For intentionally idempotent operations or testing:
+ReplayProtection::Replayable
 ```
 
 ### Lower-Level: with_posted_signatures

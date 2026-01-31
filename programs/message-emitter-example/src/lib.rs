@@ -257,7 +257,6 @@ mod tests {
     #[test]
     fn test_emitter_pda() {
         let (emitter, bump) = find_emitter_address();
-        assert!(bump <= 255);
 
         // Verify it's a valid PDA
         let derived = Pubkey::create_program_address(&[EMITTER_SEED, &[bump]], &crate::ID);

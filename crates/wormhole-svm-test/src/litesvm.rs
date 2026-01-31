@@ -53,6 +53,26 @@ pub enum WormholeTestError {
     LoadError(String),
     #[error("VAA verification bypass detected: {0}")]
     VerificationBypass(String),
+    #[error("Replay protection missing: {0}")]
+    ReplayProtectionMissing(String),
+}
+
+/// Specifies whether a VAA operation should be replay-protected.
+///
+/// Used with [`with_vaa`] to automatically verify replay protection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReplayProtection {
+    /// The operation can be replayed (no replay protection check).
+    /// Use this for operations that are intentionally idempotent or for
+    /// testing error paths.
+    Replayable,
+
+    /// The operation must NOT be replayable (default).
+    /// After successful execution, `with_vaa` will attempt to replay the
+    /// same VAA. If the replay succeeds, the test fails with
+    /// `ReplayProtectionMissing`.
+    #[default]
+    NonReplayable,
 }
 
 /// Configuration for loading Wormhole programs.
@@ -471,9 +491,9 @@ where
     Ok(result)
 }
 
-/// Execute a closure that verifies a VAA, with automatic verification safety check.
+/// Execute a closure that verifies a VAA, with automatic verification and replay safety checks.
 ///
-/// This helper ensures your program actually verifies VAAs by:
+/// This helper ensures your program actually verifies VAAs and (optionally) has replay protection:
 ///
 /// 1. **Negative test (on cloned SVM)**: Clones the SVM, posts mismatched signatures,
 ///    and runs your closure. If it succeeds, your program doesn't verify VAAs -
@@ -482,14 +502,24 @@ where
 /// 2. **Positive test (on original SVM)**: Posts correct signatures and runs your
 ///    closure, committing state changes.
 ///
+/// 3. **Replay test (if `NonReplayable`)**: Clones the SVM after success, attempts to
+///    run the closure again with the same VAA. If it succeeds, returns `ReplayProtectionMissing`.
+///    The clone is discarded on failure, restoring the original successful state.
+///
 /// The closure receives `(svm, guardian_signatures_pubkey, vaa_body)` where `vaa_body`
 /// is just the body bytes (used for digest calculation). Using clone + discard
 /// ensures the negative test behaves identically to real execution.
 ///
+/// # Arguments
+///
+/// * `replay_protection` - Whether to verify replay protection:
+///   - `NonReplayable` (default): Verify the operation cannot be replayed
+///   - `Replayable`: Skip replay protection check (for idempotent operations)
+///
 /// # Example
 ///
 /// ```ignore
-/// use wormhole_svm_test::{with_vaa, TestVaa, emitter_address_from_20};
+/// use wormhole_svm_test::{with_vaa, TestVaa, emitter_address_from_20, ReplayProtection};
 ///
 /// let vaa = TestVaa::new(1, emitter_address_from_20([0xAB; 20]), 42, payload);
 ///
@@ -499,6 +529,7 @@ where
 ///     &guardians,
 ///     0, // guardian_set_index
 ///     &vaa,
+///     ReplayProtection::NonReplayable, // Verify replay protection
 ///     |svm, sigs_pubkey, vaa_body| {
 ///         let ix = build_my_verify_instruction(sigs_pubkey, vaa_body);
 ///         let tx = Transaction::new_signed_with_payer(...);
@@ -509,13 +540,14 @@ where
 ///
 /// # See Also
 ///
-/// - [`with_vaa_unchecked`] - Skip the automatic negative test (use sparingly)
+/// - [`with_vaa_unchecked`] - Skip all automatic tests (use sparingly)
 pub fn with_vaa<F, T, E>(
     svm: &mut LiteSVM,
     payer: &Keypair,
     guardians: &TestGuardianSet,
     guardian_set_index: u32,
     vaa: &crate::TestVaa,
+    replay_protection: ReplayProtection,
     mut f: F,
 ) -> Result<T, WormholeTestError>
 where
@@ -565,6 +597,38 @@ where
         .map_err(|e| WormholeTestError::LoadError(format!("VAA verification failed: {}", e)))?;
 
     close_signatures(svm, payer, &posted.pubkey, &payer.pubkey())?;
+
+    // === REPLAY TEST (if NonReplayable) ===
+    if replay_protection == ReplayProtection::NonReplayable {
+        // Clone the SVM after successful execution
+        let mut svm_replay_clone = svm.clone();
+
+        // Post signatures again on the clone
+        let replay_posted = post_signatures(
+            &mut svm_replay_clone,
+            payer,
+            guardian_set_index,
+            &correct_signatures,
+        )?;
+
+        // Try to run the closure again with the same VAA
+        let replay_result = f(&mut svm_replay_clone, &replay_posted.pubkey, &vaa_body);
+
+        // Clone is discarded regardless - we only care about the result
+
+        // If replay succeeded, the program lacks replay protection!
+        if replay_result.is_ok() {
+            return Err(WormholeTestError::ReplayProtectionMissing(
+                "SECURITY: Program accepted the same VAA twice! \
+                 This means your program lacks replay protection. \
+                 Ensure you mark VAAs as used (e.g., via solana-noreplay) \
+                 before processing them."
+                    .to_string(),
+            ));
+        }
+        // Replay failed as expected - replay protection is working
+        // The clone is dropped, original SVM state (after first successful call) is preserved
+    }
 
     Ok(result)
 }

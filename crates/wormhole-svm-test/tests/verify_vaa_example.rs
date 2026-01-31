@@ -144,7 +144,7 @@ fn test_end_to_end_vaa_verification() {
 /// handle signing, posting, verification safety check, and cleanup.
 #[test]
 fn test_with_vaa_helper() {
-    use wormhole_svm_test::with_vaa;
+    use wormhole_svm_test::{with_vaa, ReplayProtection};
 
     let mut svm = LiteSVM::new();
     let payer = Keypair::new();
@@ -173,12 +173,14 @@ fn test_with_vaa_helper() {
     // with_vaa:
     // 1. Clones SVM, runs with wrong signatures (should fail - verifies program checks)
     // 2. Runs on original SVM with correct signatures (should succeed)
+    // Note: Using Replayable since vaa-verifier-example doesn't have replay protection
     let result = with_vaa(
         &mut svm,
         &payer,
         &guardians,
         GUARDIAN_SET_INDEX,
         &vaa,
+        ReplayProtection::Replayable, // Example program doesn't have replay protection
         |svm, sigs_pubkey, vaa_body| {
             let verify_ix = vaa_verifier_example::build_verify_vaa_instruction(
                 &payer.pubkey(),
@@ -212,7 +214,7 @@ fn test_with_vaa_helper() {
 /// should detect this and return a VerificationBypass error.
 #[test]
 fn test_with_vaa_catches_unverified_program() {
-    use wormhole_svm_test::{with_vaa, WormholeTestError};
+    use wormhole_svm_test::{with_vaa, ReplayProtection, WormholeTestError};
 
     let mut svm = LiteSVM::new();
     let payer = Keypair::new();
@@ -238,12 +240,14 @@ fn test_with_vaa_catches_unverified_program() {
     );
 
     // Use the INSECURE skip_verify instruction
+    // Note: Using Replayable since we expect VerificationBypass error before replay check
     let result = with_vaa(
         &mut svm,
         &payer,
         &guardians,
         GUARDIAN_SET_INDEX,
         &vaa,
+        ReplayProtection::Replayable,
         |svm, sigs_pubkey, vaa_body| {
             // Use the insecure instruction that skips verification
             let skip_ix = vaa_verifier_example::build_skip_verify_instruction(
@@ -267,22 +271,95 @@ fn test_with_vaa_catches_unverified_program() {
         },
     );
 
-    // with_vaa should detect the bypass and return an error
+    // with_vaa should detect the bypass with the specific error variant
+    let err = result.expect_err("with_vaa should have detected verification bypass");
+
     assert!(
-        result.is_err(),
-        "with_vaa should have detected verification bypass"
+        matches!(err, WormholeTestError::VerificationBypass(_)),
+        "Expected VerificationBypass error, got: {:?}",
+        err
     );
 
-    match result {
-        Err(WormholeTestError::VerificationBypass(msg)) => {
-            println!("Correctly caught verification bypass: {}", msg);
-            assert!(msg.contains("SECURITY"));
-        }
-        Err(e) => panic!("Expected VerificationBypass error, got: {:?}", e),
-        Ok(_) => panic!("Expected error but got success"),
-    }
-
+    println!("Correctly caught: {}", err);
     println!("with_vaa correctly detected the insecure program!");
+}
+
+/// Test that with_vaa catches programs that lack replay protection.
+///
+/// The vaa-verifier-example program correctly verifies VAA signatures but
+/// does NOT implement replay protection. When using `ReplayProtection::NonReplayable`,
+/// `with_vaa` should detect that the same VAA can be processed twice and return
+/// a `ReplayProtectionMissing` error.
+#[test]
+fn test_with_vaa_catches_missing_replay_protection() {
+    use wormhole_svm_test::{with_vaa, ReplayProtection, WormholeTestError};
+
+    let mut svm = LiteSVM::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let guardians = TestGuardianSet::single(TestGuardian::default());
+
+    let wormhole = setup_wormhole(
+        &mut svm,
+        &guardians,
+        GUARDIAN_SET_INDEX,
+        WormholeProgramsConfig::default(),
+    )
+    .expect("Failed to setup Wormhole");
+
+    load_example_program(&mut svm);
+
+    let vaa = TestVaa::new(
+        1,
+        emitter_address_from_20([0xDE; 20]),
+        555,
+        b"This VAA should not be replayable!".to_vec(),
+    );
+
+    // Use NonReplayable to verify replay protection
+    // The vaa-verifier-example program does NOT have replay protection,
+    // so with_vaa should detect this and fail
+    let result = with_vaa(
+        &mut svm,
+        &payer,
+        &guardians,
+        GUARDIAN_SET_INDEX,
+        &vaa,
+        ReplayProtection::NonReplayable,
+        |svm, sigs_pubkey, vaa_body| {
+            let verify_ix = vaa_verifier_example::build_verify_vaa_instruction(
+                &payer.pubkey(),
+                &wormhole.guardian_set,
+                sigs_pubkey,
+                wormhole.guardian_set_bump,
+                vaa_body,
+            );
+
+            let blockhash = svm.latest_blockhash();
+            let tx = Transaction::new_signed_with_payer(
+                &[verify_ix],
+                Some(&payer.pubkey()),
+                &[&payer],
+                blockhash,
+            );
+
+            svm.send_transaction(tx)
+                .map_err(|e| format!("tx failed: {:?}", e))
+        },
+    );
+
+    // with_vaa should detect the missing replay protection with the specific error variant
+    let err = result.expect_err("with_vaa should have detected missing replay protection");
+
+    assert!(
+        matches!(err, WormholeTestError::ReplayProtectionMissing(_)),
+        "Expected ReplayProtectionMissing error, got: {:?}",
+        err
+    );
+
+    println!("Correctly caught: {}", err);
+    println!("with_vaa correctly detected the program lacks replay protection!");
 }
 
 /// Test using the with_posted_signatures bracket helper (lower-level).
