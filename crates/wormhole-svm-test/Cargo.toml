@@ -7,8 +7,8 @@ license = "Apache-2.0"
 
 [features]
 default = []
-litesvm = ["dep:litesvm", "dep:solana-sdk", "dep:wormhole-svm-definitions", "dep:wormhole-svm-shim"]
-resolver = ["litesvm", "dep:wormhole-svm-submit"]
+litesvm = ["dep:litesvm", "dep:solana-sdk", "dep:wormhole-svm-definitions", "dep:wormhole-svm-shim", "dep:wormhole-svm-submit"]
+resolver = ["litesvm"]
 bundled-fixtures = ["litesvm"]
 
 [dependencies]
@@ -36,6 +36,7 @@ optional = true
 [dependencies.wormhole-svm-submit]
 workspace = true
 optional = true
+default-features = false
 
 [dev-dependencies]
 vaa-verifier-example = { path = "../../programs/vaa-verifier-example", features = ["no-entrypoint"] }

@@ -12,7 +12,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 hex = { workspace = true }
-wormhole-svm-submit = { workspace = true }
+wormhole-svm-submit = { workspace = true, features = ["rpc"] }
 wormhole-svm-definitions = { workspace = true }
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }

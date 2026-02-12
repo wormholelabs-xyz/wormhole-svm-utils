@@ -62,7 +62,12 @@ fn run() -> Result<()> {
     }
 }
 
-fn cmd_submit(cli: &Cli, program_id: &str, payer_path: &str, vaa_arg: Option<String>) -> Result<()> {
+fn cmd_submit(
+    cli: &Cli,
+    program_id: &str,
+    payer_path: &str,
+    vaa_arg: Option<String>,
+) -> Result<()> {
     let raw = read_input(vaa_arg)?;
 
     let (guardian_set_index, signatures, body) =
@@ -146,8 +151,8 @@ fn read_input(arg: Option<String>) -> Result<Vec<u8>> {
     match arg {
         Some(s) if s.starts_with('@') => {
             let path = &s[1..];
-            let contents = std::fs::read_to_string(path)
-                .with_context(|| format!("reading file: {}", path))?;
+            let contents =
+                std::fs::read_to_string(path).with_context(|| format!("reading file: {}", path))?;
             hex::decode(contents.trim()).context("decoding hex from file")
         }
         Some(s) => hex::decode(s.trim()).context("decoding hex payload"),
@@ -164,8 +169,7 @@ fn read_input(arg: Option<String>) -> Result<Vec<u8>> {
 
 const CORE_BRIDGE_MAINNET: Pubkey =
     wormhole_svm_definitions::solana::mainnet::CORE_BRIDGE_PROGRAM_ID;
-const CORE_BRIDGE_DEVNET: Pubkey =
-    wormhole_svm_definitions::solana::devnet::CORE_BRIDGE_PROGRAM_ID;
+const CORE_BRIDGE_DEVNET: Pubkey = wormhole_svm_definitions::solana::devnet::CORE_BRIDGE_PROGRAM_ID;
 
 fn core_bridge_from_rpc_url(rpc_url: &str) -> Option<Pubkey> {
     let url = rpc_url.to_lowercase();

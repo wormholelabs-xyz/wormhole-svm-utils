@@ -21,18 +21,13 @@ pub use resolve::{
     InstructionGroup, ResolverResult, SerializableAccountMeta, SerializableInstruction,
     RESOLVER_PUBKEY_SHIM_VAA_SIGS,
 };
+pub use signatures::{build_close_signatures_ix, build_post_signatures_ix, PostedSignatures};
 
 // Re-export placeholder constants at crate root for convenience.
 pub use executor_account_resolver_svm::{RESOLVER_PUBKEY_GUARDIAN_SET, RESOLVER_PUBKEY_PAYER};
 
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{Keypair, Signature, Signer},
-};
-use wormhole_svm_definitions::find_guardian_set_address;
-
 /// Maximum resolver iterations before giving up.
+#[cfg(feature = "rpc")]
 const MAX_RESOLVER_ITERATIONS: usize = 10;
 
 /// Errors that can occur during VAA submission.
@@ -48,6 +43,7 @@ pub enum SubmitError {
     Execution(String),
 }
 
+#[cfg(feature = "rpc")]
 impl From<solana_client::client_error::ClientError> for SubmitError {
     fn from(e: solana_client::client_error::ClientError) -> Self {
         SubmitError::Connection(e.to_string())
@@ -75,15 +71,18 @@ impl From<solana_client::client_error::ClientError> for SubmitError {
 /// * `vaa_body` - The VAA body bytes (without header/signatures)
 /// * `guardian_signatures` - Guardian signatures (66 bytes each: [index, r, s, v])
 /// * `core_bridge` - Wormhole Core Bridge program ID (for guardian set PDA derivation)
+#[cfg(feature = "rpc")]
 pub fn broadcast_vaa(
-    rpc_client: &mut RpcClient,
-    payer: &Keypair,
-    program_id: &Pubkey,
+    rpc_client: &mut solana_client::rpc_client::RpcClient,
+    payer: &solana_sdk::signature::Keypair,
+    program_id: &solana_sdk::pubkey::Pubkey,
     guardian_set_index: u32,
     vaa_body: &[u8],
     guardian_signatures: &[[u8; 66]],
-    core_bridge: &Pubkey,
-) -> Result<Vec<Signature>, SubmitError> {
+    core_bridge: &solana_sdk::pubkey::Pubkey,
+) -> Result<Vec<solana_sdk::signature::Signature>, SubmitError> {
+    use wormhole_svm_definitions::find_guardian_set_address;
+
     let (guardian_set, _bump) =
         find_guardian_set_address(guardian_set_index.to_be_bytes(), core_bridge);
 
@@ -132,18 +131,17 @@ pub fn broadcast_vaa(
         guardian_set_index,
         guardian_signatures,
     )?;
-    let sigs_pubkey = posted.keypair.pubkey();
-    eprintln!("Signatures posted: {}", sigs_pubkey);
+    eprintln!("Signatures posted: {}", posted.pubkey);
 
     // Steps 3-4 wrapped so we always close signatures even on failure
-    let result = (|| -> Result<Vec<Signature>, SubmitError> {
+    let result = (|| -> Result<Vec<solana_sdk::signature::Signature>, SubmitError> {
         // Step 3: Execute resolved instructions
         eprintln!("Executing resolved instructions...");
         let tx_sigs = execute::execute_instruction_groups(
             rpc_client,
             payer,
             &resolved.instruction_groups,
-            &sigs_pubkey,
+            &posted.pubkey,
             &guardian_set,
         )?;
         for sig in &tx_sigs {
@@ -155,7 +153,8 @@ pub fn broadcast_vaa(
 
     // Step 4: Always close signatures account to reclaim rent
     eprintln!("Closing signatures account...");
-    if let Err(e) = signatures::close_signatures(rpc_client, payer, &verify_vaa_shim, &sigs_pubkey)
+    if let Err(e) =
+        signatures::close_signatures(rpc_client, payer, &verify_vaa_shim, &posted.pubkey)
     {
         eprintln!("Warning: failed to close signatures account: {}", e);
     }

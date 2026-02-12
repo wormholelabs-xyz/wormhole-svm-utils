@@ -20,14 +20,12 @@
 
 use litesvm::LiteSVM;
 use solana_sdk::{
-    account::Account,
-    hash::Hash,
     pubkey::Pubkey,
     signature::{Keypair, Signature},
-    transaction::Transaction,
 };
 
-use wormhole_svm_submit::SolanaConnection;
+use crate::litesvm::{LiteSvmConnection, ReplayProtection, WormholeTestError};
+use crate::TestGuardianSet;
 
 // Re-export types consumers need for inspecting resolved instructions.
 pub use wormhole_svm_submit::resolve::{
@@ -37,46 +35,8 @@ pub use wormhole_svm_submit::{
     SubmitError, RESOLVER_PUBKEY_GUARDIAN_SET, RESOLVER_PUBKEY_PAYER, RESOLVER_PUBKEY_SHIM_VAA_SIGS,
 };
 
-/// Error type for the LiteSVM connection adapter.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct LiteSvmError(pub String);
-
-/// Adapter that implements [`SolanaConnection`] for LiteSVM.
-pub struct LiteSvmConnection<'a>(pub &'a mut LiteSVM);
-
-impl SolanaConnection for LiteSvmConnection<'_> {
-    type Error = LiteSvmError;
-
-    fn get_latest_blockhash(&self) -> Result<Hash, Self::Error> {
-        Ok(self.0.latest_blockhash())
-    }
-
-    fn simulate_return_data(&self, tx: &Transaction) -> Result<Option<Vec<u8>>, Self::Error> {
-        let result = self
-            .0
-            .simulate_transaction(tx.clone())
-            .map_err(|e| LiteSvmError(format!("Simulation failed: {:?}", e)))?;
-
-        let data = &result.meta.return_data.data;
-        if data.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(data.clone()))
-        }
-    }
-
-    fn send_and_confirm(&mut self, tx: &Transaction) -> Result<Signature, Self::Error> {
-        self.0
-            .send_transaction(tx.clone())
-            .map(|_| tx.signatures[0])
-            .map_err(|e| LiteSvmError(format!("Transaction failed: {:?}", e)))
-    }
-
-    fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Account>, Self::Error> {
-        Ok(self.0.get_account(pubkey))
-    }
-}
+/// Maximum resolver iterations before giving up.
+const MAX_RESOLVER_ITERATIONS: usize = 10;
 
 /// Convenience wrapper around [`wormhole_svm_submit::resolve::resolve_execute_vaa_v1`]
 /// for LiteSVM.
@@ -106,4 +66,73 @@ pub fn resolve_execute_vaa_v1(
         max_iterations,
     )
     .map_err(|e| e.to_string())
+}
+
+/// Submit a signed VAA to a program via the resolver-executor flow, with full
+/// safety checks (negative test + optional replay protection).
+///
+/// This is the test-crate equivalent of [`wormhole_svm_submit::broadcast_vaa`]:
+/// it runs the resolve → post-signatures → execute → close-signatures flow, but
+/// wraps it in [`with_vaa`](crate::with_vaa) so that:
+///
+/// 1. A **negative test** verifies the program rejects mismatched signatures.
+/// 2. A **positive test** executes the VAA against the real SVM state.
+/// 3. An optional **replay test** verifies the program rejects the same VAA twice.
+///
+/// # Arguments
+///
+/// * `svm` - LiteSVM instance (must have the target program and Wormhole loaded)
+/// * `payer` - Keypair that pays for transactions
+/// * `program_id` - The program implementing `resolve_execute_vaa_v1`
+/// * `guardians` - Test guardian set for signing
+/// * `guardian_set_index` - On-chain guardian set index
+/// * `vaa` - The test VAA to submit
+/// * `replay_protection` - Whether to verify replay protection
+pub fn broadcast_vaa(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    program_id: &Pubkey,
+    guardians: &TestGuardianSet,
+    guardian_set_index: u32,
+    vaa: &crate::TestVaa,
+    replay_protection: ReplayProtection,
+) -> Result<Vec<Signature>, WormholeTestError> {
+    use wormhole_svm_definitions::find_guardian_set_address;
+    use wormhole_svm_definitions::solana::mainnet::CORE_BRIDGE_PROGRAM_ID;
+
+    let (guardian_set, _bump) =
+        find_guardian_set_address(guardian_set_index.to_be_bytes(), &CORE_BRIDGE_PROGRAM_ID);
+
+    let program_id = *program_id;
+
+    crate::with_vaa(
+        svm,
+        payer,
+        guardians,
+        guardian_set_index,
+        vaa,
+        replay_protection,
+        |svm, sigs_pubkey, vaa_body| -> Result<Vec<Signature>, String> {
+            // Step 1: Resolve accounts
+            let resolved = resolve_execute_vaa_v1(
+                svm,
+                &program_id,
+                payer,
+                vaa_body,
+                &guardian_set,
+                MAX_RESOLVER_ITERATIONS,
+            )?;
+
+            // Step 2: Execute resolved instructions
+            let mut conn = LiteSvmConnection(svm);
+            wormhole_svm_submit::execute::execute_instruction_groups(
+                &mut conn,
+                payer,
+                &resolved.instruction_groups,
+                sigs_pubkey,
+                &guardian_set,
+            )
+            .map_err(|e| e.to_string())
+        },
+    )
 }

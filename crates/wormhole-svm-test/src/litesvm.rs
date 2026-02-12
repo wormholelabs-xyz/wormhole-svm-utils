@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use litesvm::LiteSVM;
 use solana_sdk::{
     account::Account,
+    hash::Hash,
     instruction::Instruction,
     pubkey::Pubkey,
     rent::Rent,
-    signature::{Keypair, Signer},
+    signature::{Keypair, Signature, Signer},
     transaction::Transaction,
 };
 use thiserror::Error;
@@ -19,10 +20,9 @@ use wormhole_svm_definitions::{
         VERIFY_VAA_SHIM_PROGRAM_ID,
     },
 };
-use wormhole_svm_shim::verify_vaa::{
-    CloseSignatures, CloseSignaturesAccounts, PostSignatures, PostSignaturesAccounts,
-    PostSignaturesData,
-};
+use wormhole_svm_submit::SolanaConnection;
+
+pub use wormhole_svm_submit::signatures::PostedSignatures;
 
 use crate::TestGuardianSet;
 
@@ -55,6 +55,8 @@ pub enum WormholeTestError {
     VerificationBypass(String),
     #[error("Replay protection missing: {0}")]
     ReplayProtectionMissing(String),
+    #[error("Submit error: {0}")]
+    SubmitError(#[from] wormhole_svm_submit::SubmitError),
 }
 
 /// Specifies whether a VAA operation should be replay-protected.
@@ -371,13 +373,54 @@ pub fn build_guardian_set_data(guardians: &TestGuardianSet, index: u32) -> Vec<u
     data
 }
 
-/// Result of posting signatures to the verify shim.
-pub struct PostedSignatures {
-    /// The keypair for the signatures account (needed for signing close transaction).
-    pub keypair: Keypair,
-    /// The public key of the signatures account.
-    pub pubkey: Pubkey,
+// =============================================================================
+// LiteSVM ↔ SolanaConnection adapter
+// =============================================================================
+
+/// Error type for the LiteSVM connection adapter.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct LiteSvmError(pub String);
+
+/// Adapter that implements [`SolanaConnection`] for LiteSVM.
+pub struct LiteSvmConnection<'a>(pub &'a mut LiteSVM);
+
+impl SolanaConnection for LiteSvmConnection<'_> {
+    type Error = LiteSvmError;
+
+    fn get_latest_blockhash(&self) -> Result<Hash, Self::Error> {
+        Ok(self.0.latest_blockhash())
+    }
+
+    fn simulate_return_data(&self, tx: &Transaction) -> Result<Option<Vec<u8>>, Self::Error> {
+        let result = self
+            .0
+            .simulate_transaction(tx.clone())
+            .map_err(|e| LiteSvmError(format!("Simulation failed: {:?}", e)))?;
+
+        let data = &result.meta.return_data.data;
+        if data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(data.clone()))
+        }
+    }
+
+    fn send_and_confirm(&mut self, tx: &Transaction) -> Result<Signature, Self::Error> {
+        self.0
+            .send_transaction(tx.clone())
+            .map(|_| tx.signatures[0])
+            .map_err(|e| LiteSvmError(format!("Transaction failed: {:?}", e)))
+    }
+
+    fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Account>, Self::Error> {
+        Ok(self.0.get_account(pubkey))
+    }
 }
+
+// =============================================================================
+// Signature posting (delegates to wormhole-svm-submit generic functions)
+// =============================================================================
 
 /// Post guardian signatures to the verify VAA shim.
 ///
@@ -391,33 +434,15 @@ pub fn post_signatures(
     guardian_set_index: u32,
     signatures: &[[u8; 66]],
 ) -> Result<PostedSignatures, WormholeTestError> {
-    let guardian_sigs_keypair = Keypair::new();
-
-    let ix = PostSignatures {
-        program_id: &VERIFY_VAA_SHIM_PROGRAM_ID,
-        accounts: PostSignaturesAccounts {
-            payer: &payer.pubkey(),
-            guardian_signatures: &guardian_sigs_keypair.pubkey(),
-        },
-        data: PostSignaturesData::new(guardian_set_index, signatures.len() as u8, signatures),
-    }
-    .instruction();
-
-    let blockhash = svm.latest_blockhash();
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&payer.pubkey()),
-        &[payer, &guardian_sigs_keypair],
-        blockhash,
-    );
-
-    svm.send_transaction(tx)
-        .map_err(|e| WormholeTestError::LoadError(format!("post_signatures failed: {:?}", e)))?;
-
-    Ok(PostedSignatures {
-        pubkey: guardian_sigs_keypair.pubkey(),
-        keypair: guardian_sigs_keypair,
-    })
+    let mut conn = LiteSvmConnection(svm);
+    wormhole_svm_submit::signatures::post_signatures(
+        &mut conn,
+        payer,
+        &VERIFY_VAA_SHIM_PROGRAM_ID,
+        guardian_set_index,
+        signatures,
+    )
+    .map_err(WormholeTestError::from)
 }
 
 /// Close a guardian signatures account to reclaim rent.
@@ -429,14 +454,11 @@ pub fn close_signatures(
     signatures_pubkey: &Pubkey,
     refund_recipient: &Pubkey,
 ) -> Result<(), WormholeTestError> {
-    let ix = CloseSignatures {
-        program_id: &VERIFY_VAA_SHIM_PROGRAM_ID,
-        accounts: CloseSignaturesAccounts {
-            guardian_signatures: signatures_pubkey,
-            refund_recipient,
-        },
-    }
-    .instruction();
+    let ix = wormhole_svm_submit::build_close_signatures_ix(
+        &VERIFY_VAA_SHIM_PROGRAM_ID,
+        signatures_pubkey,
+        refund_recipient,
+    );
 
     let blockhash = svm.latest_blockhash();
     let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], blockhash);
@@ -678,6 +700,7 @@ where
 
     Ok(result)
 }
+
 /// Build a post_signatures instruction without sending it.
 ///
 /// Useful if you need to combine this with other instructions in a single transaction.
@@ -687,15 +710,13 @@ pub fn build_post_signatures_ix(
     guardian_set_index: u32,
     signatures: &[[u8; 66]],
 ) -> Instruction {
-    PostSignatures {
-        program_id: &VERIFY_VAA_SHIM_PROGRAM_ID,
-        accounts: PostSignaturesAccounts {
-            payer,
-            guardian_signatures: guardian_signatures_keypair,
-        },
-        data: PostSignaturesData::new(guardian_set_index, signatures.len() as u8, signatures),
-    }
-    .instruction()
+    wormhole_svm_submit::build_post_signatures_ix(
+        payer,
+        guardian_signatures_keypair,
+        &VERIFY_VAA_SHIM_PROGRAM_ID,
+        guardian_set_index,
+        signatures,
+    )
 }
 
 /// Build a close_signatures instruction without sending it.
@@ -705,14 +726,11 @@ pub fn build_close_signatures_ix(
     guardian_signatures: &Pubkey,
     refund_recipient: &Pubkey,
 ) -> Instruction {
-    CloseSignatures {
-        program_id: &VERIFY_VAA_SHIM_PROGRAM_ID,
-        accounts: CloseSignaturesAccounts {
-            guardian_signatures,
-            refund_recipient,
-        },
-    }
-    .instruction()
+    wormhole_svm_submit::build_close_signatures_ix(
+        &VERIFY_VAA_SHIM_PROGRAM_ID,
+        guardian_signatures,
+        refund_recipient,
+    )
 }
 
 // =============================================================================
