@@ -203,9 +203,39 @@ let result = with_vaa(
 )?;
 ```
 
+### Full End-to-End: broadcast_vaa (Recommended)
+
+`broadcast_vaa` is the test-crate counterpart to [`wormhole_svm_submit::broadcast_vaa`](#rpc-usage-broadcast_vaa). It runs the complete resolve → post-signatures → execute → close-signatures flow, wrapped in `with_vaa` so you get all three safety checks automatically:
+
+1. **Negative test**: rejects mismatched signatures
+2. **Positive test**: executes the VAA
+3. **Replay test** (if `NonReplayable`): rejects duplicate VAAs
+
+```toml
+[dev-dependencies]
+wormhole-svm-test = { version = "0.1", features = ["bundled-fixtures", "resolver"] }
+```
+
+```rust
+use wormhole_svm_test::{broadcast_vaa, TestVaa, TestGuardianSet, TestGuardian, ReplayProtection};
+
+let guardians = TestGuardianSet::single(TestGuardian::default());
+let vaa = TestVaa::new(1, [0xAB; 32], 42, payload);
+
+let tx_sigs = broadcast_vaa(
+    &mut svm,
+    &payer,
+    &program_id,
+    &guardians,
+    0, // guardian set index
+    &vaa,
+    ReplayProtection::NonReplayable,
+)?;
+```
+
 ### Resolver integration
 
-Enable the `resolver` feature to use the account resolver with LiteSVM:
+Enable the `resolver` feature to use the account resolver with LiteSVM directly:
 
 ```toml
 [dev-dependencies]
