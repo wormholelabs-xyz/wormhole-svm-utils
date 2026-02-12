@@ -2,7 +2,7 @@
 name = "vaa-verifier-example"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal example program demonstrating VAA verification with wormhole-svm-test"
+description = "Minimal example program demonstrating VAA verification with wormhole-svm-utils"
 
 [lib]
 crate-type = ["cdylib", "lib"]

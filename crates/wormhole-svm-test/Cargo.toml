@@ -8,7 +8,7 @@ license = "Apache-2.0"
 [features]
 default = []
 litesvm = ["dep:litesvm", "dep:solana-sdk", "dep:wormhole-svm-definitions", "dep:wormhole-svm-shim"]
-resolver = ["litesvm", "dep:executor-account-resolver-svm", "dep:anchor-lang"]
+resolver = ["litesvm", "dep:wormhole-svm-submit"]
 bundled-fixtures = ["litesvm"]
 
 [dependencies]
@@ -33,11 +33,7 @@ optional = true
 workspace = true
 optional = true
 
-[dependencies.anchor-lang]
-workspace = true
-optional = true
-
-[dependencies.executor-account-resolver-svm]
+[dependencies.wormhole-svm-submit]
 workspace = true
 optional = true
 

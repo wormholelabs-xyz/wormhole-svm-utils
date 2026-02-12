@@ -1,16 +1,88 @@
-# wormhole-svm-test
+# wormhole-svm-utils
 
-Testing utilities for Solana programs integrating with Wormhole.
+Testing and submission utilities for Solana programs integrating with Wormhole.
 
-## Features
+This workspace contains two crates:
+
+- **`wormhole-svm-test`** — LiteSVM testing helpers: guardian signing, VAA construction, environment setup, automatic verification and replay checks
+- **`wormhole-svm-submit`** — Generic VAA submission via the executor-account-resolver protocol, with a `SolanaConnection` trait that abstracts over RPC and LiteSVM
+
+## Workspace Structure
+
+```
+wormhole-svm-utils/
+├── crates/
+│   ├── wormhole-svm-test/       # Test utilities (guardians, VAA signing, LiteSVM helpers)
+│   └── wormhole-svm-submit/     # SolanaConnection trait + generic resolver/executor + RPC impl
+├── programs/
+│   ├── vaa-verifier-example/    # Example program: verify VAA via shim CPI
+│   └── message-emitter-example/ # Example program: emit Wormhole message
+```
+
+## wormhole-svm-submit
+
+Generic library for submitting signed VAAs to programs that implement the `resolve_execute_vaa_v1` instruction from [executor-account-resolver-svm](https://github.com/wormholelabs-xyz/executor-account-resolver-svm).
+
+### SolanaConnection trait
+
+The core abstraction that allows the same resolver/executor logic to work against both RPC and LiteSVM:
+
+```rust
+pub trait SolanaConnection {
+    type Error: std::error::Error + Send + 'static;
+    fn get_latest_blockhash(&self) -> Result<Hash, Self::Error>;
+    fn simulate_return_data(&self, tx: &Transaction) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn send_and_confirm(&mut self, tx: &Transaction) -> Result<Signature, Self::Error>;
+    fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Account>, Self::Error>;
+}
+```
+
+Built-in implementations:
+- `impl SolanaConnection for RpcClient` — for CLI tools and production use
+- `LiteSvmConnection` adapter in `wormhole-svm-test` — for tests
+
+### RPC usage (broadcast_vaa)
+
+For CLI tools and relayers, `broadcast_vaa` performs the complete flow: post signatures, resolve accounts, execute, close signatures.
+
+```rust
+use wormhole_svm_submit::broadcast_vaa;
+
+let tx_sigs = broadcast_vaa(
+    &mut rpc_client,
+    &payer,
+    &program_id,
+    guardian_set_index,
+    &vaa_body,
+    &guardian_signatures,
+    &core_bridge,
+)?;
+```
+
+### Generic resolver
+
+For custom integrations, use the resolver and executor directly with any `SolanaConnection`:
+
+```rust
+use wormhole_svm_submit::resolve::resolve_execute_vaa_v1;
+use wormhole_svm_submit::execute::execute_instruction_groups;
+
+let resolved = resolve_execute_vaa_v1(&conn, &program_id, &payer, &vaa_body, &guardian_set, 10)?;
+let sigs = execute_instruction_groups(&mut conn, &payer, &resolved.instruction_groups, &sigs_pubkey, &guardian_set)?;
+```
+
+## wormhole-svm-test
+
+### Features
 
 - **Guardian signing**: Create test guardians with configurable keys, sign VAA bodies
 - **VAA construction**: Build and sign VAAs for testing
 - **LiteSVM integration** (optional): Load Wormhole programs and set up guardian accounts
 - **Signature helpers** (optional): Post/close guardian signatures with bracket pattern
 - **Bundled fixtures** (optional): Pre-bundled mainnet program binaries for zero-setup testing
+- **Resolver** (optional): Account resolution via `wormhole-svm-submit` with LiteSVM adapter
 
-## Usage
+### Usage
 
 ```rust
 use wormhole_svm_test::{TestGuardian, TestGuardianSet, TestVaa};
@@ -92,6 +164,31 @@ let result = with_vaa(
 )?;
 ```
 
+### Resolver integration
+
+Enable the `resolver` feature to use the account resolver with LiteSVM:
+
+```toml
+[dev-dependencies]
+wormhole-svm-test = { version = "0.1", features = ["bundled-fixtures", "resolver"] }
+```
+
+```rust
+use wormhole_svm_test::resolve_execute_vaa_v1;
+
+let result = resolve_execute_vaa_v1(
+    &mut svm,
+    &program_id,
+    &payer,
+    &vaa_body,
+    &wormhole.guardian_set,
+    10, // max iterations
+)?;
+
+// result.instruction_groups contains the resolved instructions
+// result.iterations shows how many rounds it took
+```
+
 ### Replay Protection
 
 The `ReplayProtection` parameter controls whether `with_vaa` verifies that your program
@@ -106,16 +203,6 @@ cannot process the same VAA twice:
   - Operations that are intentionally idempotent
   - Testing error paths where you expect `VerificationBypass` before replay check
   - Programs that handle replay protection through other means
-
-```rust
-use wormhole_svm_test::ReplayProtection;
-
-// For programs that MUST have replay protection (most cases):
-ReplayProtection::NonReplayable
-
-// For intentionally idempotent operations or testing:
-ReplayProtection::Replayable
-```
 
 ### Lower-Level: with_posted_signatures
 
@@ -139,27 +226,6 @@ with_posted_signatures(
         Ok(())
     },
 )?;
-```
-
-### Manual Control
-
-For full control over the signature lifecycle:
-
-```rust
-use wormhole_svm_test::{post_signatures, close_signatures, TestVaa};
-
-let vaa = TestVaa::new(1, emitter, sequence, payload);
-let vaa_body = vaa.body();  // Body bytes for digest calculation
-let signatures = vaa.guardian_signatures(&guardians);
-
-// Step 1: Post signatures
-let posted = post_signatures(&mut svm, &payer, 0, &signatures)?;
-
-// Step 2: Your verification logic using posted.pubkey and vaa_body
-// ...
-
-// Step 3: Close to reclaim rent
-close_signatures(&mut svm, &payer, &posted.pubkey, &payer.pubkey())?;
 ```
 
 ### Without Bundled Fixtures

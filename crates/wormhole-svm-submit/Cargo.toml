@@ -1,0 +1,15 @@
+[package]
+name = "wormhole-svm-submit"
+version = "0.1.0"
+edition = "2021"
+description = "Submit signed VAAs to Solana programs via the executor-account-resolver protocol"
+
+[dependencies]
+solana-client = { workspace = true }
+solana-sdk = { workspace = true }
+wormhole-svm-shim = { workspace = true }
+wormhole-svm-definitions = { workspace = true }
+executor-account-resolver-svm = { workspace = true }
+borsh = "0.10"
+base64 = { workspace = true }
+thiserror = { workspace = true }
