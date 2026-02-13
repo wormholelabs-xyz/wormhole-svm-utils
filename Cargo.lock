@@ -1494,7 +1494,7 @@ dependencies = [
 [[package]]
 name = "executor-account-resolver-svm"
 version = "0.0.1"
-source = "git+https://github.com/wormholelabs-xyz/executor-account-resolver-svm#c180f40149bbb48e019e95d5a5daa1512fe063ac"
+source = "git+https://github.com/wormholelabs-xyz/executor-account-resolver-svm?rev=c180f401#c180f40149bbb48e019e95d5a5daa1512fe063ac"
 dependencies = [
  "anchor-lang",
 ]
@@ -7222,7 +7222,7 @@ dependencies = [
 [[package]]
 name = "wormhole-svm-definitions"
 version = "1.0.0"
-source = "git+https://github.com/wormhole-foundation/wormhole#e11926a849391e8a035c69fc52f4efb3205258fd"
+source = "git+https://github.com/wormhole-foundation/wormhole?rev=e11926a8#e11926a849391e8a035c69fc52f4efb3205258fd"
 dependencies = [
  "cfg-if",
  "const-crypto",
@@ -7233,7 +7233,7 @@ dependencies = [
 [[package]]
 name = "wormhole-svm-shim"
 version = "0.1.0"
-source = "git+https://github.com/wormhole-foundation/wormhole#e11926a849391e8a035c69fc52f4efb3205258fd"
+source = "git+https://github.com/wormhole-foundation/wormhole?rev=e11926a8#e11926a849391e8a035c69fc52f4efb3205258fd"
 dependencies = [
  "solana-program",
  "wormhole-svm-definitions",

@@ -41,6 +41,28 @@ enum Command {
         /// Signed VAA (hex string, @file, or stdin)
         vaa: Option<String>,
     },
+
+    /// Fetch and dump an account's data as hex
+    Account {
+        /// Account address (or use `pda:<PROGRAM_ID>:seed1:seed2` to derive)
+        address: String,
+    },
+
+    /// Derive a PDA for a program
+    ///
+    /// Seeds can be strings or hex (prefix with 0x).
+    ///
+    /// Examples:
+    ///   svm-vaa pda <PROGRAM_ID> foo bar baz
+    ///   svm-vaa pda <PROGRAM_ID> 0xdeadbeef "hello"
+    Pda {
+        /// Program ID to derive PDA for
+        program_id: String,
+
+        /// Seeds (strings or 0x-prefixed hex)
+        #[arg(required = true, num_args = 1..)]
+        seeds: Vec<String>,
+    },
 }
 
 fn main() {
@@ -59,6 +81,8 @@ fn run() -> Result<()> {
             payer,
             vaa,
         } => cmd_submit(&cli, program_id, payer, vaa.clone()),
+        Command::Account { address } => cmd_account(&cli, address),
+        Command::Pda { program_id, seeds } => cmd_pda(program_id, seeds),
     }
 }
 
@@ -170,6 +194,71 @@ fn read_input(arg: Option<String>) -> Result<Vec<u8>> {
 const CORE_BRIDGE_MAINNET: Pubkey =
     wormhole_svm_definitions::solana::mainnet::CORE_BRIDGE_PROGRAM_ID;
 const CORE_BRIDGE_DEVNET: Pubkey = wormhole_svm_definitions::solana::devnet::CORE_BRIDGE_PROGRAM_ID;
+
+fn cmd_account(cli: &Cli, address: &str) -> Result<()> {
+    let pubkey = parse_address(address)?;
+    let rpc = solana_client::rpc_client::RpcClient::new(&cli.rpc_url);
+    let account = rpc
+        .get_account(&pubkey)
+        .with_context(|| format!("fetching account {}", pubkey))?;
+
+    eprintln!("address: {}", pubkey);
+    eprintln!("owner:   {}", account.owner);
+    eprintln!("lamports: {}", account.lamports);
+    eprintln!("data len: {}", account.data.len());
+    println!("{}", hex::encode(&account.data));
+    Ok(())
+}
+
+/// Parse an address as a base58 pubkey or `pda:<PROGRAM_ID>:seed1:seed2:...`
+fn parse_address(address: &str) -> Result<Pubkey> {
+    if let Some(rest) = address.strip_prefix("pda:") {
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() < 2 {
+            bail!("pda: syntax requires at least program_id and one seed: pda:<PROGRAM_ID>:seed1:...");
+        }
+        let program_id = Pubkey::from_str(parts[0]).context("invalid program ID in pda: address")?;
+        let seed_bytes: Vec<Vec<u8>> = parts[1..]
+            .iter()
+            .map(|s| {
+                if let Some(hex_str) = s.strip_prefix("0x") {
+                    hex::decode(hex_str).with_context(|| format!("invalid hex seed: {}", s))
+                } else {
+                    Ok(s.as_bytes().to_vec())
+                }
+            })
+            .collect::<Result<_>>()?;
+        let seed_slices: Vec<&[u8]> = seed_bytes.iter().map(|s| s.as_slice()).collect();
+        let (pda, bump) = Pubkey::find_program_address(&seed_slices, &program_id);
+        eprintln!("pda: {} (bump {})", pda, bump);
+        Ok(pda)
+    } else {
+        Pubkey::from_str(address).context("invalid account address")
+    }
+}
+
+fn cmd_pda(program_id: &str, seeds: &[String]) -> Result<()> {
+    let program_id = Pubkey::from_str(program_id).context("invalid program ID")?;
+
+    let seed_bytes: Vec<Vec<u8>> = seeds
+        .iter()
+        .map(|s| {
+            if let Some(hex_str) = s.strip_prefix("0x") {
+                hex::decode(hex_str).with_context(|| format!("invalid hex seed: {}", s))
+            } else {
+                Ok(s.as_bytes().to_vec())
+            }
+        })
+        .collect::<Result<_>>()?;
+
+    let seed_slices: Vec<&[u8]> = seed_bytes.iter().map(|s| s.as_slice()).collect();
+    let (pda, bump) =
+        Pubkey::find_program_address(&seed_slices, &program_id);
+
+    println!("{}", pda);
+    eprintln!("bump: {}", bump);
+    Ok(())
+}
 
 fn core_bridge_from_rpc_url(rpc_url: &str) -> Option<Pubkey> {
     let url = rpc_url.to_lowercase();
