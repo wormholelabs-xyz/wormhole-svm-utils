@@ -19,8 +19,7 @@ solana-sdk = "2.3"
 solana-client = "2.3"
 solana-program = "2.3"
 wormhole-raw-vaas = "0.3.0"
-wormhole-svm-definitions = { git = "https://github.com/wormhole-foundation/wormhole", features = ["verify-vaa-shim"] }
-wormhole-svm-shim = { git = "https://github.com/wormhole-foundation/wormhole" }
+wormhole-svm-definitions = { git = "https://github.com/wormhole-foundation/wormhole", rev = "e11926a8", features = ["verify-vaa-shim"] }
+wormhole-svm-shim = { git = "https://github.com/wormhole-foundation/wormhole", rev = "e11926a8" }
 wormhole-svm-submit = { path = "crates/wormhole-svm-submit", default-features = false }
-# TODO: pin
-executor-account-resolver-svm = { git = "https://github.com/wormholelabs-xyz/executor-account-resolver-svm" }
+executor-account-resolver-svm = { git = "https://github.com/wormholelabs-xyz/executor-account-resolver-svm", rev = "c180f401" }
