@@ -141,24 +141,27 @@ fn test_with_vaa_helper() {
     load_example_program(&mut svm);
 
     // Create the VAA
-    let vaa = TestVaa::new(
+    // Example program only verifies signatures, not emitter fields.
+    let mut vaa = TestVaa::new(
         1,
         emitter_address_from_20([0xEF; 20]),
         999,
         b"with_vaa helper test".to_vec(),
     );
+    vaa.checks.emitter_chain = false;
+    vaa.checks.emitter_address = false;
 
     // with_vaa:
     // 1. Clones SVM, runs with wrong signatures (should fail - verifies program checks)
     // 2. Runs on original SVM with correct signatures (should succeed)
     // Note: Using Replayable since vaa-verifier-example doesn't have replay protection
+    vaa.checks.replay = ReplayProtection::Replayable;
     let result = with_vaa(
         &mut svm,
         &payer,
         &guardians,
         GUARDIAN_SET_INDEX,
         &vaa,
-        ReplayProtection::Replayable, // Example program doesn't have replay protection
         |svm, sigs_pubkey, vaa_body| {
             let verify_ix = vaa_verifier_example::build_verify_vaa_instruction(
                 &payer.pubkey(),
@@ -210,22 +213,25 @@ fn test_with_vaa_catches_unverified_program() {
 
     load_example_program(&mut svm);
 
-    let vaa = TestVaa::new(
+    let mut vaa = TestVaa::new(
         1,
         emitter_address_from_20([0xBA; 20]),
         777,
         b"This VAA will not be verified!".to_vec(),
     );
+    // Emitter checks are irrelevant here; we expect VerificationBypass before they run.
+    vaa.checks.emitter_chain = false;
+    vaa.checks.emitter_address = false;
 
     // Use the INSECURE skip_verify instruction
     // Note: Using Replayable since we expect VerificationBypass error before replay check
+    vaa.checks.replay = ReplayProtection::Replayable;
     let result = with_vaa(
         &mut svm,
         &payer,
         &guardians,
         GUARDIAN_SET_INDEX,
         &vaa,
-        ReplayProtection::Replayable,
         |svm, sigs_pubkey, vaa_body| {
             // Use the insecure instruction that skips verification
             let skip_ix = vaa_verifier_example::build_skip_verify_instruction(
@@ -270,7 +276,7 @@ fn test_with_vaa_catches_unverified_program() {
 /// a `ReplayProtectionMissing` error.
 #[test]
 fn test_with_vaa_catches_missing_replay_protection() {
-    use wormhole_svm_test::{with_vaa, ReplayProtection, WormholeTestError};
+    use wormhole_svm_test::{with_vaa, WormholeTestError};
 
     let mut svm = LiteSVM::new();
     let payer = Keypair::new();
@@ -288,12 +294,15 @@ fn test_with_vaa_catches_missing_replay_protection() {
 
     load_example_program(&mut svm);
 
-    let vaa = TestVaa::new(
+    let mut vaa = TestVaa::new(
         1,
         emitter_address_from_20([0xDE; 20]),
         555,
         b"This VAA should not be replayable!".to_vec(),
     );
+    // Example program only verifies signatures, not emitter fields.
+    vaa.checks.emitter_chain = false;
+    vaa.checks.emitter_address = false;
 
     // Use NonReplayable to verify replay protection
     // The vaa-verifier-example program does NOT have replay protection,
@@ -304,7 +313,6 @@ fn test_with_vaa_catches_missing_replay_protection() {
         &guardians,
         GUARDIAN_SET_INDEX,
         &vaa,
-        ReplayProtection::NonReplayable,
         |svm, sigs_pubkey, vaa_body| {
             let verify_ix = vaa_verifier_example::build_verify_vaa_instruction(
                 &payer.pubkey(),

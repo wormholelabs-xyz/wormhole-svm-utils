@@ -4,6 +4,49 @@ use sha3::{Digest, Keccak256};
 
 use crate::TestGuardianSet;
 
+/// Specifies whether a VAA operation should be replay-protected.
+///
+/// Used by [`VaaChecks`] to control the automatic replay test in `with_vaa`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReplayProtection {
+    /// The operation can be replayed (no replay protection check).
+    /// Use this for operations that are intentionally idempotent or for
+    /// testing error paths.
+    Replayable,
+
+    /// The operation must NOT be replayable (default).
+    /// After successful execution, `with_vaa` will attempt to replay the
+    /// same VAA. If the replay succeeds, the test fails with
+    /// `ReplayProtectionMissing`.
+    #[default]
+    NonReplayable,
+}
+
+/// Controls which automatic negative tests `with_vaa` runs.
+///
+/// By default all checks are enabled. Disable specific checks for instructions
+/// where a field is intentionally unchecked (e.g. `initialize` derives its PDA
+/// from the emitter address, so any address is valid).
+#[derive(Clone, Copy)]
+pub struct VaaChecks {
+    /// Test that the program rejects a VAA with a different emitter chain.
+    pub emitter_chain: bool,
+    /// Test that the program rejects a VAA with a different emitter address.
+    pub emitter_address: bool,
+    /// Test that the program rejects a replayed VAA.
+    pub replay: ReplayProtection,
+}
+
+impl Default for VaaChecks {
+    fn default() -> Self {
+        Self {
+            emitter_chain: true,
+            emitter_address: true,
+            replay: ReplayProtection::default(),
+        }
+    }
+}
+
 /// A test VAA for construction and signing.
 #[derive(Clone)]
 pub struct TestVaa {
@@ -23,6 +66,8 @@ pub struct TestVaa {
     pub consistency_level: u8,
     /// The guardian set index (defaults to 0).
     pub guardian_set_index: u32,
+    /// Which automatic negative tests to run in `with_vaa`.
+    pub checks: VaaChecks,
 }
 
 impl TestVaa {
@@ -42,6 +87,7 @@ impl TestVaa {
             nonce: 0,
             consistency_level: 1,
             guardian_set_index: 0,
+            checks: VaaChecks::default(),
         }
     }
 

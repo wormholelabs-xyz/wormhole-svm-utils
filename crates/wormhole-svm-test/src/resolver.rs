@@ -24,7 +24,7 @@ use solana_sdk::{
     signature::{Keypair, Signature},
 };
 
-use crate::litesvm::{LiteSvmConnection, ReplayProtection, WormholeTestError};
+use crate::litesvm::{LiteSvmConnection, WormholeTestError};
 use crate::TestGuardianSet;
 
 // Re-export types consumers need for inspecting resolved instructions.
@@ -87,7 +87,6 @@ pub fn resolve_execute_vaa_v1(
 /// * `guardians` - Test guardian set for signing
 /// * `guardian_set_index` - On-chain guardian set index
 /// * `vaa` - The test VAA to submit
-/// * `replay_protection` - Whether to verify replay protection
 pub fn broadcast_vaa(
     svm: &mut LiteSVM,
     payer: &Keypair,
@@ -95,7 +94,6 @@ pub fn broadcast_vaa(
     guardians: &TestGuardianSet,
     guardian_set_index: u32,
     vaa: &crate::TestVaa,
-    replay_protection: ReplayProtection,
 ) -> Result<Vec<Signature>, WormholeTestError> {
     use wormhole_svm_definitions::find_guardian_set_address;
     use wormhole_svm_definitions::solana::mainnet::CORE_BRIDGE_PROGRAM_ID;
@@ -111,7 +109,6 @@ pub fn broadcast_vaa(
         guardians,
         guardian_set_index,
         vaa,
-        replay_protection,
         |svm, sigs_pubkey, vaa_body| -> Result<Vec<Signature>, String> {
             // Step 1: Resolve accounts
             let resolved = resolve_execute_vaa_v1(

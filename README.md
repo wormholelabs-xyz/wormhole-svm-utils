@@ -194,45 +194,40 @@ let wormhole = setup_wormhole(
 
 ### Verifying VAAs (Recommended)
 
-Use `with_vaa` for the cleanest API. It automatically ensures your program actually
-verifies VAAs and (optionally) has replay protection:
+Use `with_vaa` for the cleanest API. It automatically runs negative tests to ensure
+your program validates VAAs correctly:
 
-1. **Negative test (on cloned SVM)**: Clones the SVM, posts mismatched signatures, and
-   executes your transaction. If it succeeds, returns `VerificationBypass` error - your
-   program isn't verifying! (Clone is discarded, no state changes persist.)
-2. **Positive test (executed)**: Builds and sends your transaction with correct signatures.
-3. **Replay test (if `NonReplayable`)**: Clones the SVM after success, attempts to run the
-   transaction again with the same VAA. If it succeeds, returns `ReplayProtectionMissing`
-   error - your program lacks replay protection!
+1. **Signature verification** — posts mismatched signatures; fails with `VerificationBypass` if accepted
+2. **Emitter chain** — posts a VAA with wrong chain; fails with `EmitterChainBypass` if accepted
+3. **Emitter address** — posts a VAA with wrong address; fails with `EmitterAddressBypass` if accepted
+4. **Positive test** — executes with correct signatures (commits state)
+5. **Replay protection** (if `NonReplayable`) — replays the same VAA; fails with `ReplayProtectionMissing` if accepted
+
+All negative tests run on cloned SVMs that are discarded afterward — no state leaks.
+
+Checks are controlled per-VAA via `VaaChecks` (all enabled by default):
 
 ```rust
-use wormhole_svm_test::{with_vaa, TestVaa, emitter_address_from_20, ReplayProtection};
+use wormhole_svm_test::{with_vaa, TestVaa, VaaChecks, ReplayProtection, emitter_address_from_20};
 
 let vaa = TestVaa::new(1, emitter_address_from_20([0xAB; 20]), 42, payload);
 
-// Closure receives (svm, sigs_pubkey, vaa_body) - body bytes for digest calculation
-let result = with_vaa(
-    &mut svm,
-    &payer,
-    &guardians,
-    0, // guardian set index
-    &vaa,
-    ReplayProtection::NonReplayable, // Verify replay protection
-    |svm, sigs_pubkey, vaa_body| {
-        let ix = build_my_verify_instruction(sigs_pubkey, vaa_body);
-        let tx = Transaction::new_signed_with_payer(...);
-        svm.send_transaction(tx).map_err(|e| format!("{:?}", e))
-    },
-)?;
+// All checks enabled by default
+let result = with_vaa(&mut svm, &payer, &guardians, 0, &vaa, |svm, sigs_pubkey, vaa_body| {
+    let ix = build_my_verify_instruction(sigs_pubkey, vaa_body);
+    let tx = Transaction::new_signed_with_payer(...);
+    svm.send_transaction(tx).map_err(|e| format!("{:?}", e))
+})?;
+
+// Disable specific checks when the program intentionally skips them
+let mut vaa = TestVaa::new(1, [0xAB; 32], 42, payload);
+vaa.checks.emitter_address = false;          // e.g. initialize accepts any emitter
+vaa.checks.replay = ReplayProtection::Replayable; // e.g. idempotent operations
 ```
 
 ### Full End-to-End: broadcast_vaa (Recommended)
 
-`broadcast_vaa` is the test-crate counterpart to [`wormhole_svm_submit::broadcast_vaa`](#rpc-usage-broadcast_vaa). It runs the complete resolve → post-signatures → execute → close-signatures flow, wrapped in `with_vaa` so you get all three safety checks automatically:
-
-1. **Negative test**: rejects mismatched signatures
-2. **Positive test**: executes the VAA
-3. **Replay test** (if `NonReplayable`): rejects duplicate VAAs
+`broadcast_vaa` is the test-crate counterpart to [`wormhole_svm_submit::broadcast_vaa`](#rpc-usage-broadcast_vaa). It runs the complete resolve → post-signatures → execute → close-signatures flow, wrapped in `with_vaa` so you get all the safety checks automatically.
 
 ```toml
 [dev-dependencies]
@@ -240,7 +235,7 @@ wormhole-svm-test = { version = "0.1", features = ["bundled-fixtures", "resolver
 ```
 
 ```rust
-use wormhole_svm_test::{broadcast_vaa, TestVaa, TestGuardianSet, TestGuardian, ReplayProtection};
+use wormhole_svm_test::{broadcast_vaa, TestVaa, TestGuardianSet, TestGuardian};
 
 let guardians = TestGuardianSet::single(TestGuardian::default());
 let vaa = TestVaa::new(1, [0xAB; 32], 42, payload);
@@ -252,7 +247,6 @@ let tx_sigs = broadcast_vaa(
     &guardians,
     0, // guardian set index
     &vaa,
-    ReplayProtection::NonReplayable,
 )?;
 ```
 
@@ -280,21 +274,6 @@ let result = resolve_execute_vaa_v1(
 // result.instruction_groups contains the resolved instructions
 // result.iterations shows how many rounds it took
 ```
-
-### Replay Protection
-
-The `ReplayProtection` parameter controls whether `with_vaa` verifies that your program
-cannot process the same VAA twice:
-
-- **`NonReplayable` (default)**: After successful execution, `with_vaa` attempts to replay
-  the same VAA. If the replay succeeds, your program lacks replay protection - a critical
-  security vulnerability. Consider using [solana-noreplay](https://crates.io/crates/solana-noreplay)
-  or similar mechanisms to mark VAAs as used.
-
-- **`Replayable`**: Skip the replay protection check. Use this for:
-  - Operations that are intentionally idempotent
-  - Testing error paths where you expect `VerificationBypass` before replay check
-  - Programs that handle replay protection through other means
 
 ### Lower-Level: with_posted_signatures
 

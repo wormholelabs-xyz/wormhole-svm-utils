@@ -53,29 +53,17 @@ pub enum WormholeTestError {
     LoadError(String),
     #[error("VAA verification bypass detected: {0}")]
     VerificationBypass(String),
+    #[error("Emitter chain check missing: {0}")]
+    EmitterChainBypass(String),
+    #[error("Emitter address check missing: {0}")]
+    EmitterAddressBypass(String),
     #[error("Replay protection missing: {0}")]
     ReplayProtectionMissing(String),
     #[error("Submit error: {0}")]
     SubmitError(#[from] wormhole_svm_submit::SubmitError),
 }
 
-/// Specifies whether a VAA operation should be replay-protected.
-///
-/// Used with [`with_vaa`] to automatically verify replay protection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum ReplayProtection {
-    /// The operation can be replayed (no replay protection check).
-    /// Use this for operations that are intentionally idempotent or for
-    /// testing error paths.
-    Replayable,
-
-    /// The operation must NOT be replayable (default).
-    /// After successful execution, `with_vaa` will attempt to replay the
-    /// same VAA. If the replay succeeds, the test fails with
-    /// `ReplayProtectionMissing`.
-    #[default]
-    NonReplayable,
-}
+// ReplayProtection is defined in vaa.rs and re-exported from the crate root.
 
 /// Configuration for loading Wormhole programs.
 #[derive(Default)]
@@ -577,7 +565,6 @@ pub fn with_vaa<F, T, E>(
     guardians: &TestGuardianSet,
     guardian_set_index: u32,
     vaa: &crate::TestVaa,
-    replay_protection: ReplayProtection,
     mut f: F,
 ) -> Result<T, WormholeTestError>
 where
@@ -618,6 +605,48 @@ where
         ));
     }
 
+    // === NEGATIVE TEST: Wrong emitter chain (on cloned SVM) ===
+    if vaa.checks.emitter_chain {
+        let mut svm_clone = svm.clone();
+        let wrong_chain_vaa = crate::TestVaa {
+            emitter_chain: vaa.emitter_chain.wrapping_add(1),
+            ..vaa.clone()
+        };
+        let wrong_chain_body = wrong_chain_vaa.body();
+        let wrong_chain_sigs = wrong_chain_vaa.guardian_signatures(guardians);
+        let posted = post_signatures(&mut svm_clone, payer, guardian_set_index, &wrong_chain_sigs)?;
+        let result = f(&mut svm_clone, &posted.pubkey, &wrong_chain_body);
+        if result.is_ok() {
+            return Err(WormholeTestError::EmitterChainBypass(
+                "SECURITY: Program accepted VAA with wrong emitter chain! \
+                 Ensure you validate the emitter_chain field before processing."
+                    .to_string(),
+            ));
+        }
+    }
+
+    // === NEGATIVE TEST: Wrong emitter address (on cloned SVM) ===
+    if vaa.checks.emitter_address {
+        let mut svm_clone = svm.clone();
+        let mut wrong_addr = vaa.emitter_address;
+        wrong_addr[31] ^= 0xFF;
+        let wrong_addr_vaa = crate::TestVaa {
+            emitter_address: wrong_addr,
+            ..vaa.clone()
+        };
+        let wrong_addr_body = wrong_addr_vaa.body();
+        let wrong_addr_sigs = wrong_addr_vaa.guardian_signatures(guardians);
+        let posted = post_signatures(&mut svm_clone, payer, guardian_set_index, &wrong_addr_sigs)?;
+        let result = f(&mut svm_clone, &posted.pubkey, &wrong_addr_body);
+        if result.is_ok() {
+            return Err(WormholeTestError::EmitterAddressBypass(
+                "SECURITY: Program accepted VAA with wrong emitter address! \
+                 Ensure you validate the emitter_address field before processing."
+                    .to_string(),
+            ));
+        }
+    }
+
     // === POSITIVE TEST (on original SVM - commits state) ===
     let correct_signatures = vaa.guardian_signatures(guardians);
     let posted = post_signatures(svm, payer, guardian_set_index, &correct_signatures)?;
@@ -629,7 +658,7 @@ where
     close_signatures(svm, payer, &posted.pubkey, &payer.pubkey())?;
 
     // === REPLAY TEST (if NonReplayable) ===
-    if replay_protection == ReplayProtection::NonReplayable {
+    if vaa.checks.replay == crate::ReplayProtection::NonReplayable {
         // Clone the SVM after successful execution
         let mut svm_replay_clone = svm.clone();
 
@@ -859,6 +888,7 @@ impl PostedMessageInfo {
             nonce: self.nonce,
             consistency_level: self.consistency_level,
             guardian_set_index: 0,
+            checks: Default::default(),
         }
     }
 }
