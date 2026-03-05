@@ -33,7 +33,11 @@ The core abstraction that allows the same resolver/executor logic to work agains
 pub trait SolanaConnection {
     type Error: std::error::Error + Send + 'static;
     fn get_latest_blockhash(&self) -> Result<Hash, Self::Error>;
-    fn simulate_return_data(&self, tx: &Transaction) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn simulate_with_post_accounts(
+        &self,
+        tx: &Transaction,
+        accounts: &[Pubkey],
+    ) -> Result<SimulationResult, Self::Error>;
     fn send_and_confirm(&mut self, tx: &Transaction) -> Result<Signature, Self::Error>;
     fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Account>, Self::Error>;
 }

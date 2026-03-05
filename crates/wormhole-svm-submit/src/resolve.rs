@@ -6,7 +6,7 @@
 use borsh::BorshDeserialize;
 use executor_account_resolver_svm::{
     InstructionGroups, MissingAccounts, Resolver, RESOLVER_EXECUTE_VAA_V1,
-    RESOLVER_PUBKEY_GUARDIAN_SET, RESOLVER_PUBKEY_PAYER,
+    RESOLVER_PUBKEY_GUARDIAN_SET, RESOLVER_PUBKEY_PAYER, RESOLVER_RESULT_ACCOUNT_SEED,
 };
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
@@ -51,6 +51,10 @@ pub fn resolve_execute_vaa_v1<C: SolanaConnection>(
 ) -> Result<ResolverResult, SubmitError> {
     let mut remaining_accounts: Vec<AccountMeta> = Vec::new();
 
+    // Derive the result account PDA for the Account() flow.
+    let (result_account_pubkey, _) =
+        Pubkey::find_program_address(&[RESOLVER_RESULT_ACCOUNT_SEED], program_id);
+
     for iteration in 1..=max_iterations {
         // Build the resolver instruction data:
         // 8-byte discriminator + borsh Vec<u8> (4-byte LE length + bytes)
@@ -71,20 +75,22 @@ pub fn resolve_execute_vaa_v1<C: SolanaConnection>(
         let tx =
             Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], blockhash);
 
-        let return_data = conn
-            .simulate_return_data(&tx)
+        // Simulate with post-account data so we can handle Account() responses.
+        let sim_result = conn
+            .simulate_with_post_accounts(&tx, &[result_account_pubkey])
             .map_err(|e| {
                 SubmitError::ResolverSimulation(format!(
                     "Resolver simulation failed on iteration {}: {}",
                     iteration, e
                 ))
-            })?
-            .ok_or_else(|| {
-                SubmitError::ResolverSimulation(format!(
-                    "No return data from resolver on iteration {}",
-                    iteration
-                ))
             })?;
+
+        let return_data = sim_result.return_data.ok_or_else(|| {
+            SubmitError::ResolverSimulation(format!(
+                "No return data from resolver on iteration {}",
+                iteration
+            ))
+        })?;
 
         let resolver: Resolver<InstructionGroups> =
             BorshDeserialize::deserialize(&mut return_data.as_slice()).map_err(|e| {
@@ -107,13 +113,78 @@ pub fn resolve_execute_vaa_v1<C: SolanaConnection>(
             }) => {
                 for pubkey in &missing {
                     let actual = substitute_placeholder(*pubkey, &payer.pubkey(), guardian_set);
-                    remaining_accounts.push(AccountMeta::new_readonly(actual, false));
+                    if actual == result_account_pubkey {
+                        // Result account needs to be writable for Account() flow
+                        remaining_accounts.push(AccountMeta::new(actual, false));
+                    } else if *pubkey == RESOLVER_PUBKEY_PAYER {
+                        // Payer is writable + signer
+                        remaining_accounts.push(AccountMeta::new(actual, true));
+                    } else {
+                        remaining_accounts.push(AccountMeta::new_readonly(actual, false));
+                    }
                 }
             }
             Resolver::Account() => {
-                return Err(SubmitError::ResolverSimulation(
-                    "Resolver returned Account() -- not supported".to_string(),
-                ));
+                // The resolver wrote its result to the result account PDA.
+                // Read it from the post-simulation account data.
+                let account_data = sim_result
+                    .post_accounts
+                    .iter()
+                    .find(|(pk, _)| *pk == result_account_pubkey)
+                    .map(|(_, data)| data.as_slice())
+                    .ok_or_else(|| {
+                        SubmitError::ResolverSimulation(
+                            "Resolver returned Account() but result account not found in simulation"
+                                .to_string(),
+                        )
+                    })?;
+
+                // Skip the 8-byte Anchor discriminator.
+                if account_data.len() <= 8 {
+                    return Err(SubmitError::ResolverSimulation(
+                        "Result account data too short".to_string(),
+                    ));
+                }
+                let payload = &account_data[8..];
+
+                let resolver: Resolver<InstructionGroups> =
+                    BorshDeserialize::deserialize(&mut &payload[..]).map_err(|e| {
+                        SubmitError::ResolverSimulation(format!(
+                            "Failed to deserialize result account: {}",
+                            e
+                        ))
+                    })?;
+
+                match resolver {
+                    Resolver::Resolved(groups) => {
+                        return Ok(ResolverResult {
+                            instruction_groups: groups.0,
+                            iterations: iteration,
+                        });
+                    }
+                    Resolver::Missing(MissingAccounts {
+                        accounts: missing,
+                        address_lookup_tables: _,
+                    }) => {
+                        for pubkey in &missing {
+                            let actual =
+                                substitute_placeholder(*pubkey, &payer.pubkey(), guardian_set);
+                            if actual == result_account_pubkey {
+                                remaining_accounts.push(AccountMeta::new(actual, false));
+                            } else if *pubkey == RESOLVER_PUBKEY_PAYER {
+                                remaining_accounts.push(AccountMeta::new(actual, true));
+                            } else {
+                                remaining_accounts.push(AccountMeta::new_readonly(actual, false));
+                            }
+                        }
+                    }
+                    Resolver::Account() => {
+                        return Err(SubmitError::ResolverSimulation(
+                            "Result account itself returned Account() -- recursive not supported"
+                                .to_string(),
+                        ));
+                    }
+                }
             }
         }
     }

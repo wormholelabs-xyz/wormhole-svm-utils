@@ -385,18 +385,40 @@ impl SolanaConnection for LiteSvmConnection<'_> {
         Ok(self.0.latest_blockhash())
     }
 
-    fn simulate_return_data(&self, tx: &Transaction) -> Result<Option<Vec<u8>>, Self::Error> {
+    fn simulate_with_post_accounts(
+        &self,
+        tx: &Transaction,
+        accounts: &[Pubkey],
+    ) -> Result<wormhole_svm_submit::connection::SimulationResult, Self::Error> {
+        use solana_sdk::account::ReadableAccount;
+
         let result = self
             .0
             .simulate_transaction(tx.clone())
             .map_err(|e| LiteSvmError(format!("Simulation failed: {:?}", e)))?;
 
-        let data = &result.meta.return_data.data;
-        if data.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(data.clone()))
+        let return_data = {
+            let data = &result.meta.return_data.data;
+            if data.is_empty() {
+                None
+            } else {
+                Some(data.clone())
+            }
+        };
+
+        let mut post_accounts = Vec::new();
+        for pubkey in accounts {
+            if let Some((_, account_data)) =
+                result.post_accounts.iter().find(|(pk, _)| pk == pubkey)
+            {
+                post_accounts.push((*pubkey, account_data.data().to_vec()));
+            }
         }
+
+        Ok(wormhole_svm_submit::connection::SimulationResult {
+            return_data,
+            post_accounts,
+        })
     }
 
     fn send_and_confirm(&mut self, tx: &Transaction) -> Result<Signature, Self::Error> {

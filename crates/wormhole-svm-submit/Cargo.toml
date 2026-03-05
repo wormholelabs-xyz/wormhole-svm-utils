@@ -6,10 +6,11 @@ description = "Submit signed VAAs to Solana programs via the executor-account-re
 
 [features]
 default = ["rpc"]
-rpc = ["dep:solana-client", "dep:base64"]
+rpc = ["dep:solana-client", "dep:base64", "dep:solana-account-decoder-client-types"]
 
 [dependencies]
 solana-client = { workspace = true, optional = true }
+solana-account-decoder-client-types = { workspace = true, optional = true }
 solana-sdk = { workspace = true }
 wormhole-svm-shim = { workspace = true }
 wormhole-svm-definitions = { workspace = true }

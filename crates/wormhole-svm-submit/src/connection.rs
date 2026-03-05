@@ -4,6 +4,14 @@ use solana_sdk::{
     account::Account, hash::Hash, pubkey::Pubkey, signature::Signature, transaction::Transaction,
 };
 
+/// Result of simulating a transaction, including post-simulation account data.
+pub struct SimulationResult {
+    /// The program return data bytes, if any.
+    pub return_data: Option<Vec<u8>>,
+    /// Post-simulation account data for requested accounts (pubkey -> data bytes).
+    pub post_accounts: Vec<(Pubkey, Vec<u8>)>,
+}
+
 /// Abstraction over Solana connectivity for resolver and executor logic.
 ///
 /// Implemented for [`RpcClient`] (production) and for LiteSVM adapters (testing).
@@ -12,8 +20,13 @@ pub trait SolanaConnection {
 
     fn get_latest_blockhash(&self) -> Result<Hash, Self::Error>;
 
-    /// Simulate a transaction and return the program return data bytes, if any.
-    fn simulate_return_data(&self, tx: &Transaction) -> Result<Option<Vec<u8>>, Self::Error>;
+    /// Simulate a transaction and return both return data and post-simulation
+    /// account data for the specified accounts.
+    fn simulate_with_post_accounts(
+        &self,
+        tx: &Transaction,
+        accounts: &[Pubkey],
+    ) -> Result<SimulationResult, Self::Error>;
 
     /// Send a transaction and wait for confirmation.
     fn send_and_confirm(&mut self, tx: &Transaction) -> Result<Signature, Self::Error>;
@@ -31,7 +44,7 @@ mod rpc_impl {
         signature::Signature, transaction::Transaction,
     };
 
-    use super::SolanaConnection;
+    use super::{SimulationResult, SolanaConnection};
 
     impl SolanaConnection for RpcClient {
         type Error = solana_client::client_error::ClientError;
@@ -40,13 +53,24 @@ mod rpc_impl {
             RpcClient::get_latest_blockhash(self)
         }
 
-        fn simulate_return_data(&self, tx: &Transaction) -> Result<Option<Vec<u8>>, Self::Error> {
+        fn simulate_with_post_accounts(
+            &self,
+            tx: &Transaction,
+            accounts: &[Pubkey],
+        ) -> Result<SimulationResult, Self::Error> {
+            use solana_account_decoder_client_types::UiAccountEncoding;
+            use solana_client::rpc_config::RpcSimulateTransactionAccountsConfig;
+
             let sim_result = self.simulate_transaction_with_config(
                 tx,
                 RpcSimulateTransactionConfig {
                     sig_verify: false,
                     replace_recent_blockhash: true,
                     commitment: Some(CommitmentConfig::confirmed()),
+                    accounts: Some(RpcSimulateTransactionAccountsConfig {
+                        encoding: Some(UiAccountEncoding::Base64),
+                        addresses: accounts.iter().map(|p| p.to_string()).collect(),
+                    }),
                     ..Default::default()
                 },
             )?;
@@ -54,7 +78,6 @@ mod rpc_impl {
             let sim_value = sim_result.value;
 
             if let Some(err) = &sim_value.err {
-                // Log simulation error details for debugging
                 if let Some(logs) = &sim_value.logs {
                     for log in logs {
                         if log.contains("Error") || log.contains("error") || log.contains("failed")
@@ -71,7 +94,7 @@ mod rpc_impl {
                 ));
             }
 
-            match sim_value.return_data {
+            let return_data = match sim_value.return_data {
                 Some(rd) => {
                     let data_bytes = base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
@@ -85,15 +108,48 @@ mod rpc_impl {
                             )),
                         )
                     })?;
-
                     if data_bytes.is_empty() {
-                        Ok(None)
+                        None
                     } else {
-                        Ok(Some(data_bytes))
+                        Some(data_bytes)
                     }
                 }
-                None => Ok(None),
+                None => None,
+            };
+
+            let mut post_accounts = Vec::new();
+            if let Some(sim_accounts) = sim_value.accounts {
+                for (i, maybe_account) in sim_accounts.iter().enumerate() {
+                    if i < accounts.len() {
+                        if let Some(ui_account) = maybe_account {
+                            use solana_account_decoder_client_types::UiAccountData;
+                            let b64_str = match &ui_account.data {
+                                UiAccountData::Binary(s, _) => s.as_str(),
+                                UiAccountData::LegacyBinary(s) => s.as_str(),
+                                _ => continue,
+                            };
+                            let data_bytes = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                b64_str,
+                            )
+                            .map_err(|e| {
+                                solana_client::client_error::ClientError::from(
+                                    solana_client::rpc_request::RpcError::ForUser(format!(
+                                        "Failed to decode account data: {}",
+                                        e
+                                    )),
+                                )
+                            })?;
+                            post_accounts.push((accounts[i], data_bytes));
+                        }
+                    }
+                }
             }
+
+            Ok(SimulationResult {
+                return_data,
+                post_accounts,
+            })
         }
 
         fn send_and_confirm(&mut self, tx: &Transaction) -> Result<Signature, Self::Error> {
