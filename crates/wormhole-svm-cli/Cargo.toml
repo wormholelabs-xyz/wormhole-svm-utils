@@ -15,4 +15,4 @@ hex = { workspace = true }
 wormhole-svm-submit = { workspace = true, features = ["rpc"] }
 wormhole-svm-definitions = { workspace = true }
 solana-sdk = { workspace = true }
-solana-client = { workspace = true }
+solana-rpc-client = { workspace = true }

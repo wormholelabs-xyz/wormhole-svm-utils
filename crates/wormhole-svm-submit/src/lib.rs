@@ -44,8 +44,8 @@ pub enum SubmitError {
 }
 
 #[cfg(feature = "rpc")]
-impl From<solana_client::client_error::ClientError> for SubmitError {
-    fn from(e: solana_client::client_error::ClientError) -> Self {
+impl From<solana_rpc_client_api::client_error::Error> for SubmitError {
+    fn from(e: solana_rpc_client_api::client_error::Error) -> Self {
         SubmitError::Connection(e.to_string())
     }
 }
@@ -73,7 +73,7 @@ impl From<solana_client::client_error::ClientError> for SubmitError {
 /// * `core_bridge` - Wormhole Core Bridge program ID (for guardian set PDA derivation)
 #[cfg(feature = "rpc")]
 pub fn broadcast_vaa(
-    rpc_client: &mut solana_client::rpc_client::RpcClient,
+    rpc_client: &mut solana_rpc_client::rpc_client::RpcClient,
     payer: &solana_sdk::signature::Keypair,
     program_id: &solana_sdk::pubkey::Pubkey,
     guardian_set_index: u32,

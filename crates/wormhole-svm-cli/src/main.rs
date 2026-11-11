@@ -113,7 +113,7 @@ fn cmd_submit(
             .context("cannot auto-detect core bridge for this RPC URL; use --core-bridge")?,
     };
 
-    let mut rpc_client = solana_client::rpc_client::RpcClient::new(&cli.rpc_url);
+    let mut rpc_client = solana_rpc_client::rpc_client::RpcClient::new(&cli.rpc_url);
 
     eprintln!("Submitting VAA to {}...", program_id);
     eprintln!("  Payer: {}", solana_sdk::signer::Signer::pubkey(&payer));
@@ -204,7 +204,7 @@ const CORE_BRIDGE_DEVNET: Pubkey = wormhole_svm_definitions::solana::devnet::COR
 
 fn cmd_account(cli: &Cli, address: &str) -> Result<()> {
     let pubkey = parse_address(address)?;
-    let rpc = solana_client::rpc_client::RpcClient::new(&cli.rpc_url);
+    let rpc = solana_rpc_client::rpc_client::RpcClient::new(&cli.rpc_url);
     let account = rpc
         .get_account(&pubkey)
         .with_context(|| format!("fetching account {}", pubkey))?;
