@@ -37,8 +37,8 @@ pub trait SolanaConnection {
 
 #[cfg(feature = "rpc")]
 mod rpc_impl {
-    use solana_client::rpc_client::RpcClient;
-    use solana_client::rpc_config::RpcSimulateTransactionConfig;
+    use solana_rpc_client::rpc_client::RpcClient;
+    use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
     use solana_sdk::{
         account::Account, commitment_config::CommitmentConfig, hash::Hash, pubkey::Pubkey,
         signature::Signature, transaction::Transaction,
@@ -47,7 +47,7 @@ mod rpc_impl {
     use super::{SimulationResult, SolanaConnection};
 
     impl SolanaConnection for RpcClient {
-        type Error = solana_client::client_error::ClientError;
+        type Error = solana_rpc_client_api::client_error::Error;
 
         fn get_latest_blockhash(&self) -> Result<Hash, Self::Error> {
             RpcClient::get_latest_blockhash(self)
@@ -59,7 +59,7 @@ mod rpc_impl {
             accounts: &[Pubkey],
         ) -> Result<SimulationResult, Self::Error> {
             use solana_account_decoder_client_types::UiAccountEncoding;
-            use solana_client::rpc_config::RpcSimulateTransactionAccountsConfig;
+            use solana_rpc_client_api::config::RpcSimulateTransactionAccountsConfig;
 
             let sim_result = self.simulate_transaction_with_config(
                 tx,
@@ -86,8 +86,8 @@ mod rpc_impl {
                         }
                     }
                 }
-                return Err(solana_client::client_error::ClientError::from(
-                    solana_client::rpc_request::RpcError::ForUser(format!(
+                return Err(solana_rpc_client_api::client_error::Error::from(
+                    solana_rpc_client_api::request::RpcError::ForUser(format!(
                         "Simulation error: {:?}",
                         err
                     )),
@@ -101,8 +101,8 @@ mod rpc_impl {
                         &rd.data.0,
                     )
                     .map_err(|e| {
-                        solana_client::client_error::ClientError::from(
-                            solana_client::rpc_request::RpcError::ForUser(format!(
+                        solana_rpc_client_api::client_error::Error::from(
+                            solana_rpc_client_api::request::RpcError::ForUser(format!(
                                 "Failed to decode base64 return data: {}",
                                 e
                             )),
@@ -133,8 +133,8 @@ mod rpc_impl {
                                 b64_str,
                             )
                             .map_err(|e| {
-                                solana_client::client_error::ClientError::from(
-                                    solana_client::rpc_request::RpcError::ForUser(format!(
+                                solana_rpc_client_api::client_error::Error::from(
+                                    solana_rpc_client_api::request::RpcError::ForUser(format!(
                                         "Failed to decode account data: {}",
                                         e
                                     )),
